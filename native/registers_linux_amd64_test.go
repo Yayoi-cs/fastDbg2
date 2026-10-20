@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -132,21 +133,22 @@ func TestNativeRegisterWriteValidation(t *testing.T) {
 
 func TestNativeRegisterPCWriteRejectsSuspendedBreakpoint(t *testing.T) {
 	for _, profile := range []arch.Descriptor{amd64.Descriptor(), x86.Descriptor()} {
-		e := &engine{profile: &profile, suspended: &breakpoint{addr: 0x1000, original: 0x90}}
+		e, th, _ := nativeDataTestEngine(profile)
+		th.suspended = &breakpoint{addr: 0x1000, original: 0x90}
 		other := profile.Registers[0]
 		general := target.Register{Name: other.Name, Bits: other.Bits, Data: make([]byte, other.Bits/8), Available: true}
 		pc := target.Register{Name: profile.PCName, Bits: profile.AddressBits, Data: make([]byte, profile.AddressBits/8), Available: true}
-		if err := e.checkRegisterWrites([]target.Register{general, pc}); !errors.Is(err, target.ErrInvalidState) {
+		if err := e.checkRegisterWrites(th, []target.Register{general, pc}); !errors.Is(err, target.ErrInvalidState) {
 			t.Fatalf("PC change during suspended step-over: %v", err)
 		}
-		if err := e.checkRegisterWrites([]target.Register{general}); err != nil {
+		if err := e.checkRegisterWrites(th, []target.Register{general}); err != nil {
 			t.Fatalf("other registers remain writable: %v", err)
 		}
-		if err := e.checkRegisterWrites(nil); err != nil {
+		if err := e.checkRegisterWrites(th, nil); err != nil {
 			t.Fatalf("empty batch: %v", err)
 		}
-		e.suspended = nil
-		if err := e.checkRegisterWrites([]target.Register{pc}); err != nil {
+		th.suspended = nil
+		if err := e.checkRegisterWrites(th, []target.Register{pc}); err != nil {
 			t.Fatalf("PC change without suspended step-over: %v", err)
 		}
 	}
@@ -182,8 +184,11 @@ func TestNativeRegisterSetMustMatchProfile(t *testing.T) {
 
 func TestNativeRegisterPCWidthAndCSRejectedBeforeSyscall(t *testing.T) {
 	profile := x86.Descriptor()
-	address := target.Address(0x1000)
-	e := &engine{profile: &profile, hit: &address}
+	e, th, _ := nativeDataTestEngine(profile)
+	hit := &breakpointHit{}
+	th.hit = hit
+	expected := syscallStep{pc: 0x1002, number: 1}
+	e.life.syscallSteps = map[*thread]syscallStep{th: expected}
 	if err := e.writePC(-1, 1<<32); !errors.Is(err, target.ErrOverflow) {
 		t.Fatalf("wide PC must not reach ptrace: %v", err)
 	}
@@ -193,7 +198,7 @@ func TestNativeRegisterPCWidthAndCSRejectedBeforeSyscall(t *testing.T) {
 		if err := e.writeRegisterSet(-1, data, 1); !errors.Is(err, target.ErrUnsupported) {
 			t.Fatalf("CS %#x must not reach ptrace: %v", cs, err)
 		}
-		if e.unsupported != nil || e.hit == nil || *e.hit != address {
+		if e.unsupported != nil || th.hit != hit || th.registerRevision != 0 || e.life.syscallSteps[th] != expected {
 			t.Fatal("prevalidation changed debugger state")
 		}
 	}
@@ -207,7 +212,7 @@ func TestNativeRegistersRequireStoppedEvenForEmptyWrites(t *testing.T) {
 		{target.StateRunning, target.ErrRunning},
 		{target.StateExited, target.ErrExited},
 		{target.StateDetached, target.ErrDetached},
-		{target.StateUnknown, target.ErrInvalidState},
+		{target.StateUnknown, target.ErrBusy},
 	} {
 		session := memoryTestSession(t, test.state)
 		if registers, err := session.ReadRegisters(); len(registers) != 0 || !errors.Is(err, test.want) {
@@ -228,4 +233,289 @@ func nativeRegisterTestData(profile arch.Descriptor) []byte {
 		binary.LittleEndian.PutUint32(data[52:56], 0x23)
 	}
 	return data
+}
+
+func TestNativeRegisterWriteBatchDoesNotAlias(t *testing.T) {
+	data := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	registers := []target.Register{
+		{Name: "rax", Bits: 64, Data: data, Available: true},
+		{Name: "rbx", Bits: 64, Data: data, Available: true},
+	}
+	copy := cloneRegisters(registers)
+	registers[0].Name = "changed"
+	data[0] = 9
+	if copy[0].Name != "rax" || copy[0].Data[0] != 1 || copy[1].Data[0] != 1 {
+		t.Fatal("write batch aliases its input")
+	}
+	copy[0].Data[0] = 10
+	if copy[1].Data[0] != 1 || data[0] != 9 {
+		t.Fatal("write batch values alias")
+	}
+}
+
+func TestNativeRegisterValidationUsesSelectedThread(t *testing.T) {
+	profile := amd64.Descriptor()
+	e, selected, space := nativeDataTestEngine(profile)
+	x86Profile := x86.Descriptor()
+	other := &thread{tid: -2, state: target.StateStopped, process: &process{profile: &x86Profile, space: space}}
+	other.suspended = &breakpoint{addr: 0x1000}
+	e.threads[other.tid] = other
+	pc := target.Register{Name: "rip", Bits: 64, Data: make([]byte, 8), Available: true}
+	if err := e.checkRegisterWrites(selected, []target.Register{pc}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.checkRegisterWrites(other, []target.Register{pc}); !errors.Is(err, target.ErrInvalidArgument) {
+		t.Fatalf("selected thread profile not enforced: %v", err)
+	}
+	if err := e.writePC(other.tid, 1<<32); !errors.Is(err, target.ErrOverflow) {
+		t.Fatalf("selected thread PC width not enforced: %v", err)
+	}
+	if _, err := e.readPC(-3); !errors.Is(err, target.ErrNotFound) {
+		t.Fatalf("missing TID not rejected: %v", err)
+	}
+}
+
+func TestNativeRegisterSetWriteFailureInvalidatesOnlySelectedThread(t *testing.T) {
+	profile := amd64.Descriptor()
+	e, selected, space := nativeDataTestEngine(profile)
+	other := &thread{tid: -2, state: target.StateStopped, process: &process{profile: &profile, space: space}, registerRevision: 7}
+	e.threads[other.tid] = other
+	selected.hit = &breakpointHit{}
+	otherHit := &breakpointHit{}
+	other.hit = otherHit
+	expected := syscallStep{pc: 0x1002, number: 1}
+	e.life.syscallSteps = map[*thread]syscallStep{selected: expected, other: expected}
+	err := e.writeRegisterSet(selected.tid, nativeRegisterTestData(profile), 1)
+	var partial *target.PartialError
+	if !errors.As(err, &partial) || partial.Completed != 0 || partial.Total != 1 {
+		t.Fatalf("unconfirmed SETREGSET must fail closed: %v", err)
+	}
+	if selected.registerRevision != 1 || selected.hit != nil || e.unsupported != err {
+		t.Fatal("selected thread revision or fail-closed state not updated")
+	}
+	if _, ok := e.life.syscallSteps[selected]; ok {
+		t.Fatal("unconfirmed SETREGSET retained syscall-step provenance")
+	}
+	if other.registerRevision != 7 || other.hit != otherHit || e.life.syscallSteps[other] != expected {
+		t.Fatal("unrelated thread register state was modified")
+	}
+}
+
+func TestNativeRawDataAccessRequiresExactStoppedThread(t *testing.T) {
+	profile := amd64.Descriptor()
+	e, th, _ := nativeDataTestEngine(profile)
+	for _, test := range []struct {
+		state target.State
+		want  error
+	}{
+		{target.StateRunning, target.ErrRunning},
+		{target.StateExited, target.ErrExited},
+		{target.StateDetached, target.ErrDetached},
+		{target.StateUnknown, target.ErrInvalidState},
+	} {
+		th.state = test.state
+		if _, err := e.readRegisterSet(th.tid); !errors.Is(err, test.want) {
+			t.Fatalf("register read state=%v err=%v", test.state, err)
+		}
+		if err := e.writeRegisterSet(th.tid, nativeRegisterTestData(profile), 1); !errors.Is(err, test.want) {
+			t.Fatalf("register write state=%v err=%v", test.state, err)
+		}
+		if _, err := e.readByte(th.tid, 0); !errors.Is(err, test.want) {
+			t.Fatalf("byte read state=%v err=%v", test.state, err)
+		}
+		if err := e.writeByte(th.tid, 0, 0); !errors.Is(err, test.want) {
+			t.Fatalf("byte write state=%v err=%v", test.state, err)
+		}
+	}
+	th.state = target.StateStopped
+	th.process.profile = nil
+	if _, err := e.readRegisterSet(th.tid); !errors.Is(err, target.ErrUnknown) {
+		t.Fatalf("missing process image profile: %v", err)
+	}
+	if th.registerRevision != 0 || th.process.space.revision != 0 || e.unsupported != nil {
+		t.Fatal("rejected raw access changed owner state")
+	}
+}
+
+func nativeDataSession(t *testing.T) *Session {
+	t.Helper()
+	s, err := Launch(coreFixture(t), "exit")
+	if errors.Is(err, unix.EPERM) {
+		t.Skipf("ptrace unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return s
+}
+
+func nativeDataSnapshot(t *testing.T, s *Session) target.Snapshot {
+	t.Helper()
+	snapshot, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Threads) != 1 || snapshot.Threads[0].State != target.StateStopped {
+		t.Fatalf("single stopped thread required: %+v", snapshot)
+	}
+	return snapshot
+}
+
+func TestNativeThreadRegisterTokensAndIsolation(t *testing.T) {
+	s := nativeDataSession(t)
+	snapshot := nativeDataSnapshot(t, s)
+	token := snapshot.Threads[0].Token
+	registers, err := s.ReadThreadRegisters(token)
+	if err != nil || len(registers) == 0 {
+		t.Fatalf("read selected registers=%v err=%v", registers, err)
+	}
+	original := slices.Clone(registers[0].Data)
+	registers[0].Data[0] ^= 0xff
+	again, err := s.ReadThreadRegisters(token)
+	if err != nil || !bytes.Equal(again[0].Data, original) {
+		t.Fatalf("register output aliases tracee state: %v", err)
+	}
+	foreign := token
+	foreign.Thread.Session ^= uint64(1) << 63
+	if _, err := s.ReadThreadRegisters(foreign); !errors.Is(err, target.ErrInvalidArgument) {
+		t.Fatalf("foreign register token: %v", err)
+	}
+	if err := s.WriteThreadRegisters(foreign, nil); !errors.Is(err, target.ErrInvalidArgument) {
+		t.Fatalf("foreign empty register write: %v", err)
+	}
+	if err := s.WriteThreadRegisters(token, []target.Register{again[0]}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReadThreadRegisters(token); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("pre-write register token remained valid: %v", err)
+	}
+	if err := s.WriteThreadRegisters(token, nil); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("stale empty register write: %v", err)
+	}
+	after := nativeDataSnapshot(t, s)
+	if after.Threads[0].Token.Stop != token.Stop || after.Threads[0].Token.Registers == token.Registers {
+		t.Fatalf("register write token transition old=%+v new=%+v", token, after.Threads[0].Token)
+	}
+	if after.Memory != snapshot.Memory {
+		t.Fatal("register-only write changed the memory revision")
+	}
+	if err := s.WriteThreadRegisters(after.Threads[0].Token, nil); err != nil {
+		t.Fatal(err)
+	}
+	if current := nativeDataSnapshot(t, s); current.Threads[0].Token != after.Threads[0].Token {
+		t.Fatal("empty register write changed the token")
+	}
+}
+
+func nativeDataTokenEngine() (*engine, *thread) {
+	s := &Session{id: 1}
+	s.state.Store(uint32(target.StateStopped))
+	e := &engine{s: s}
+	p := e.newProcess(101, -1, false)
+	profile := amd64.Descriptor()
+	p.profile = &profile
+	e.primary = p
+	th := e.newThread(p, 101, true)
+	th.state, th.stopEpoch = target.StateStopped, 1
+	return e, th
+}
+
+func TestNativeThreadRegisterTokenRejectsStaleStopAndIncarnation(t *testing.T) {
+	e, th := nativeDataTokenEngine()
+	current := th.token()
+	for _, token := range []target.ThreadToken{
+		{Thread: current.Thread, Stop: current.Stop + 1, Registers: current.Registers},
+		{Thread: current.Thread, Stop: current.Stop, Registers: current.Registers + 1},
+		{Thread: current.Thread, Stop: 0, Registers: current.Registers},
+	} {
+		if _, err := e.requireThread(token); !errors.Is(err, target.ErrStale) {
+			t.Fatalf("stale thread token accepted %+v: %v", token, err)
+		}
+	}
+	if got, err := e.requireThread(current); err != nil || got != th {
+		t.Fatalf("current thread token rejected: %v", err)
+	}
+	th.state = target.StateExited
+	replacement := e.newThread(th.process, th.tid, true)
+	replacement.state, replacement.stopEpoch = target.StateStopped, 1
+	if replacement.ref == current.Thread {
+		t.Fatal("kernel TID reuse retained the old thread incarnation")
+	}
+	if _, err := e.requireThread(current); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("old incarnation remained valid after TID reuse: %v", err)
+	}
+}
+
+func TestNativeDataTokensInvalidateOnResume(t *testing.T) {
+	s := nativeDataSession(t)
+	before := nativeDataSnapshot(t, s)
+	if _, err := s.Step(target.Signal{}); err != nil {
+		t.Fatal(err)
+	}
+	after := nativeDataSnapshot(t, s)
+	if before.Threads[0].Token.Stop == after.Threads[0].Token.Stop {
+		t.Fatal("resumption retained the old thread stop epoch")
+	}
+	if before.Memory == after.Memory {
+		t.Fatal("resumption retained the old memory token")
+	}
+	if _, err := s.ReadThreadRegisters(before.Threads[0].Token); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("register token survived resumption: %v", err)
+	}
+	if _, err := s.ReadSpaceMemory(before.Memory, 0, nil); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("memory token survived resumption: %v", err)
+	}
+	if _, err := s.ReadThreadRegisters(after.Threads[0].Token); err != nil {
+		t.Fatalf("new register token rejected: %v", err)
+	}
+}
+
+func TestNativeRegisterWritesForgetSyscallStep(t *testing.T) {
+	s := nativeDataSession(t)
+	for _, name := range []string{"rip", "orig_rax"} {
+		snapshot := nativeDataSnapshot(t, s)
+		token := snapshot.Threads[0].Token
+		registers, err := s.ReadThreadRegisters(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var value target.Register
+		for _, register := range registers {
+			if register.Name == name {
+				value = register
+			}
+		}
+		if value.Name == "" {
+			t.Fatalf("register %s missing", name)
+		}
+		if err := command(s, func(e *engine) error {
+			th, err := e.requireThread(token)
+			if err != nil {
+				return err
+			}
+			e.life.syscallSteps = map[*thread]syscallStep{th: {pc: 0x1002, number: 1}}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.WriteThreadRegisters(token, []target.Register{value}); err != nil {
+			t.Fatal(err)
+		}
+		retained, err := call(s, func(e *engine) (bool, error) {
+			th, err := e.findThread(token.Thread)
+			if err != nil {
+				return false, err
+			}
+			_, ok := e.life.syscallSteps[th]
+			return ok, nil
+		})
+		if err != nil || retained {
+			t.Fatalf("%s write retained syscall-step provenance: retained=%v err=%v", name, retained, err)
+		}
+	}
 }

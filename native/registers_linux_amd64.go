@@ -17,83 +17,153 @@ const generalRegisterBufferSize = 224
 
 func (s *Session) ReadRegisters() ([]target.Register, error) {
 	return call(s, func(e *engine) ([]target.Register, error) {
-		if err := e.requireStopped(); err != nil {
-			return nil, err
-		}
-		data, err := e.readRegisterSet(e.s.pid)
+		t, err := e.singleStoppedThread()
 		if err != nil {
 			return nil, err
 		}
-		return encodeRegisters(e.profile, data)
+		return e.readThreadRegisters(t)
+	})
+}
+
+func (s *Session) ReadThreadRegisters(token target.ThreadToken) ([]target.Register, error) {
+	return call(s, func(e *engine) ([]target.Register, error) {
+		t, err := e.requireThread(token)
+		if err != nil {
+			return nil, err
+		}
+		return e.readThreadRegisters(t)
 	})
 }
 
 func (s *Session) WriteRegisters(registers []target.Register) error {
+	registers = cloneRegisters(registers)
 	return command(s, func(e *engine) error {
-		if err := e.requireStopped(); err != nil {
-			return err
-		}
-		if err := e.checkRegisterWrites(registers); err != nil {
-			return err
-		}
-		if len(registers) == 0 {
-			return nil
-		}
-		data, err := e.readRegisterSet(e.s.pid)
+		t, err := e.singleStoppedThread()
 		if err != nil {
 			return err
 		}
-		writePC := false
-		for _, register := range registers {
-			field, _ := e.profile.Register(register.Name)
-			copy(data[field.Offset:field.Offset+field.Bits/8], register.Data)
-			writePC = writePC || register.Name == e.profile.PCName
-		}
-		if err := e.writeRegisterSet(e.s.pid, data, len(registers)); err != nil {
-			return err
-		}
-		if writePC {
-			e.hit = nil
-		}
-		return nil
+		return e.writeThreadRegisters(t, registers)
 	})
 }
 
-func (e *engine) readRegisterSet(pid int) ([]byte, error) {
-	if e.profile == nil {
-		return nil, fmt.Errorf("register profile is missing: %w", target.ErrUnknown)
+func (s *Session) WriteThreadRegisters(token target.ThreadToken, registers []target.Register) error {
+	registers = cloneRegisters(registers)
+	return command(s, func(e *engine) error {
+		t, err := e.requireThread(token)
+		if err != nil {
+			return err
+		}
+		return e.writeThreadRegisters(t, registers)
+	})
+}
+
+func cloneRegisters(registers []target.Register) []target.Register {
+	result := slices.Clone(registers)
+	for i := range result {
+		result[i].Data = slices.Clone(result[i].Data)
+	}
+	return result
+}
+
+func (e *engine) readThreadRegisters(t *thread) ([]target.Register, error) {
+	data, err := e.readRegisterSet(t.tid)
+	if err != nil {
+		return nil, err
+	}
+	return encodeRegisters(t.process.profile, data)
+}
+
+func (e *engine) writeThreadRegisters(t *thread, registers []target.Register) error {
+	if err := e.checkRegisterWrites(t, registers); err != nil {
+		return err
+	}
+	if len(registers) == 0 {
+		return nil
+	}
+	data, err := e.readRegisterSet(t.tid)
+	if err != nil {
+		return err
+	}
+	profile := t.process.profile
+	writePC := false
+	for _, register := range registers {
+		field, _ := profile.Register(register.Name)
+		copy(data[field.Offset:field.Offset+field.Bits/8], register.Data)
+		writePC = writePC || register.Name == profile.PCName
+	}
+	if err := e.writeRegisterSet(t.tid, data, len(registers)); err != nil {
+		return err
+	}
+	if writePC {
+		t.hit = nil
+	}
+	return nil
+}
+
+func (e *engine) dataThread(tid int) (*thread, error) {
+	t := e.threads[tid]
+	if t == nil {
+		return nil, fmt.Errorf("unknown thread %d: %w", tid, target.ErrNotFound)
+	}
+	switch t.state {
+	case target.StateStopped:
+	case target.StateRunning:
+		return nil, target.ErrRunning
+	case target.StateExited:
+		return nil, target.ErrExited
+	case target.StateDetached:
+		return nil, target.ErrDetached
+	default:
+		return nil, target.ErrInvalidState
+	}
+	if t.process == nil || t.process.profile == nil {
+		return nil, fmt.Errorf("thread %d profile is missing: %w", tid, target.ErrUnknown)
+	}
+	return t, nil
+}
+
+func (e *engine) readRegisterSet(tid int) ([]byte, error) {
+	t, err := e.dataThread(tid)
+	if err != nil {
+		return nil, err
 	}
 	data := make([]byte, generalRegisterBufferSize)
-	n, err := ptraceRegisterSet(unix.PTRACE_GETREGSET, pid, data)
+	n, err := ptraceRegisterSet(unix.PTRACE_GETREGSET, tid, data)
 	if err != nil {
-		return nil, fmt.Errorf("read register set: %w", err)
+		return nil, fmt.Errorf("read thread %d register set: %w", tid, err)
 	}
 	data = data[:n]
-	if err := validateRegisterSet(e.profile, data); err != nil {
+	if err := validateRegisterSet(t.process.profile, data); err != nil {
 		return nil, err
 	}
 	return data, nil
 }
 
-func (e *engine) writeRegisterSet(pid int, data []byte, count int) error {
-	if err := validateRegisterSet(e.profile, data); err != nil {
+func (e *engine) writeRegisterSet(tid int, data []byte, count int) error {
+	t, err := e.dataThread(tid)
+	if err != nil {
 		return err
 	}
-	n, err := ptraceRegisterSet(unix.PTRACE_SETREGSET, pid, data)
+	if err := validateRegisterSet(t.process.profile, data); err != nil {
+		return err
+	}
+	e.forgetSyscallStep(t)
+	n, err := ptraceRegisterSet(unix.PTRACE_SETREGSET, tid, data)
+	e.registersChanged(t)
 	if err == nil && n != len(data) {
 		err = fmt.Errorf("written register set size %d, expected %d: %w", n, len(data), target.ErrUnknown)
 	}
 	if err == nil {
-		_, err = e.readRegisterSet(pid)
+		_, err = e.readRegisterSet(tid)
 	}
 	if err != nil {
 		partial := &target.PartialError{
 			Op:        "write registers",
 			Completed: 0,
 			Total:     count,
-			Err:       fmt.Errorf("register state could not be confirmed after write: %w", err),
+			Err:       fmt.Errorf("thread %d register state could not be confirmed after write: %w", tid, err),
 		}
-		e.hit = nil
+		t.hit = nil
 		e.unsupported = partial
 		return partial
 	}
@@ -167,26 +237,31 @@ func validateRegisterWrites(profile *arch.Descriptor, registers []target.Registe
 	return nil
 }
 
-func (e *engine) checkRegisterWrites(registers []target.Register) error {
-	if err := validateRegisterWrites(e.profile, registers); err != nil {
+func (e *engine) checkRegisterWrites(t *thread, registers []target.Register) error {
+	if t == nil || t.process == nil {
+		return fmt.Errorf("register profile is missing: %w", target.ErrUnknown)
+	}
+	profile := t.process.profile
+	if err := validateRegisterWrites(profile, registers); err != nil {
 		return err
 	}
-	if e.suspended != nil {
+	if t.suspended != nil {
 		for _, register := range registers {
-			if register.Name == e.profile.PCName {
-				return fmt.Errorf("remove the suspended breakpoint before writing %s: %w", e.profile.PCName, target.ErrInvalidState)
+			if register.Name == profile.PCName {
+				return fmt.Errorf("remove the suspended breakpoint before writing %s: %w", profile.PCName, target.ErrInvalidState)
 			}
 		}
 	}
 	return nil
 }
 
-func (e *engine) readPC(pid int) (target.Address, error) {
-	data, err := e.readRegisterSet(pid)
+func (e *engine) readPC(tid int) (target.Address, error) {
+	data, err := e.readRegisterSet(tid)
 	if err != nil {
 		return 0, err
 	}
-	field, ok := e.profile.Register(e.profile.PCName)
+	profile := e.threads[tid].process.profile
+	field, ok := profile.Register(profile.PCName)
 	if !ok {
 		return 0, fmt.Errorf("PC register is missing: %w", target.ErrUnknown)
 	}
@@ -200,18 +275,20 @@ func (e *engine) readPC(pid int) (target.Address, error) {
 	}
 }
 
-func (e *engine) writePC(pid int, pc target.Address) error {
-	if e.profile == nil {
-		return fmt.Errorf("register profile is missing: %w", target.ErrUnknown)
-	}
-	if err := e.profile.ValidateRange(pc, 0); err != nil {
-		return err
-	}
-	data, err := e.readRegisterSet(pid)
+func (e *engine) writePC(tid int, pc target.Address) error {
+	t, err := e.dataThread(tid)
 	if err != nil {
 		return err
 	}
-	field, ok := e.profile.Register(e.profile.PCName)
+	profile := t.process.profile
+	if err := profile.ValidateRange(pc, 0); err != nil {
+		return err
+	}
+	data, err := e.readRegisterSet(tid)
+	if err != nil {
+		return err
+	}
+	field, ok := profile.Register(profile.PCName)
 	if !ok {
 		return fmt.Errorf("PC register is missing: %w", target.ErrUnknown)
 	}
@@ -223,5 +300,5 @@ func (e *engine) writePC(pid int, pc target.Address) error {
 	default:
 		return fmt.Errorf("PC register width %d: %w", field.Bits, target.ErrUnsupported)
 	}
-	return e.writeRegisterSet(pid, data, 1)
+	return e.writeRegisterSet(tid, data, 1)
 }

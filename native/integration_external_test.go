@@ -689,7 +689,7 @@ failure:
 				t.Fatal("attached process did not enter running state")
 			}
 		}
-		nativeCommand(t, s.Interrupt)
+		nativeCommand(t, func() error { return s.Interrupt() })
 		result := nativeWait(t, done)
 		if result.err != nil || result.stop.Reason != target.StopInterrupt {
 			t.Fatalf("attached interrupt: %+v, %v", result.stop, result.err)
@@ -732,11 +732,19 @@ failure:
 		if s != nil {
 			nativeSessionCleanup(t, s, false)
 		}
-		if errors.Is(err, syscall.EPERM) {
-			t.Skipf("ptrace attach denied by this environment: %v", err)
+		if err != nil {
+			t.Fatalf("group-stopped attach: %v", err)
 		}
-		if !errors.Is(err, target.ErrUnsupported) {
-			t.Fatalf("group-stopped attach should be rejected: %v", err)
+		if s.State() != target.StateStopped || s.LastStop().Reason != target.StopGroupStop {
+			t.Fatalf("group-stopped attach state: %s, %+v", s.State(), s.LastStop())
+		}
+		snapshot, err := s.Snapshot()
+		if err != nil || len(snapshot.Threads) != 1 || !snapshot.Threads[0].GroupStopped {
+			t.Fatalf("group-stop metadata: %+v, %v", snapshot, err)
+		}
+		nativeCommand(t, s.Detach)
+		if s.State() != target.StateDetached {
+			t.Fatalf("group-stop detach state: %s", s.State())
 		}
 		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()
@@ -755,7 +763,7 @@ failure:
 				}
 			}
 			if fields["TracerPid:"] != "0" {
-				t.Fatalf("failed attach retained tracing: %s", fields["TracerPid:"])
+				t.Fatalf("detach retained tracing: %s", fields["TracerPid:"])
 			}
 			if fields["State:"] == "T" {
 				break

@@ -536,7 +536,7 @@ _start:
 			t.Fatal("mixed-architecture sessions did not start")
 		}
 	}
-	nativeCommand(t, a.Interrupt)
+	nativeCommand(t, func() error { return a.Interrupt() })
 	result := nativeWait(t, aDone)
 	if result.err != nil || result.stop.Reason != target.StopInterrupt || result.stop.RawPC == nil || *result.stop.RawPC < 0xf0000000 || *result.stop.RawPC > math.MaxUint32 {
 		t.Fatalf("IA32 interrupt in mixed sessions: %+v, %v", result.stop, result.err)
@@ -645,7 +645,7 @@ failure:
 			t.Fatal("attached IA32 process did not resume")
 		}
 	}
-	nativeCommand(t, s.Interrupt)
+	nativeCommand(t, func() error { return s.Interrupt() })
 	result := nativeWait(t, done)
 	if result.err != nil || result.stop.Reason != target.StopInterrupt || result.stop.RawPC == nil || target.Address(x86Registers(t, s)["eip"]) != *result.stop.RawPC {
 		t.Fatalf("attached IA32 interrupt: %+v, %v", result.stop, result.err)

@@ -2,6 +2,7 @@ package native
 
 import (
 	"bufio"
+	"context"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
@@ -22,6 +23,95 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func coreCall[T any](t *testing.T, operation func() (T, error)) (T, error) {
+	t.Helper()
+	done := make(chan response[T], 1)
+	go func() {
+		value, err := operation()
+		done <- response[T]{value: value, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.value, result.err
+	case <-time.After(10 * time.Second):
+		var zero T
+		return zero, context.DeadlineExceeded
+	}
+}
+
+func coreClose(t *testing.T, s *Session) error {
+	t.Helper()
+	pidfd := -1
+	var pinErr error
+	if state := s.State(); state == target.StateStopped || state == target.StateRunning {
+		pidfd, pinErr = unix.PidfdOpen(s.PID(), 0)
+		if pidfd >= 0 {
+			defer unix.Close(pidfd)
+		}
+	}
+	_, err := coreCall(t, func() (struct{}, error) { return struct{}{}, s.Close() })
+	if errors.Is(err, context.DeadlineExceeded) {
+		if pidfd >= 0 {
+			pinErr = unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+			if errors.Is(pinErr, unix.ESRCH) {
+				pinErr = nil
+			}
+		}
+		_, retry := coreCall(t, func() (struct{}, error) { return struct{}{}, s.Close() })
+		return errors.Join(err, pinErr, retry)
+	}
+	return err
+}
+
+func coreOwnSession(t *testing.T, s *Session) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := coreClose(t, s); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func coreWait(t *testing.T, run *Run) (target.RunResult, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return run.Wait(ctx)
+}
+
+func coreContinue(t *testing.T, s *Session) (target.Stop, error) {
+	t.Helper()
+	return coreCall(t, func() (target.Stop, error) { return s.Continue(target.Signal{}) })
+}
+
+func coreReaped(t *testing.T, pid int) {
+	t.Helper()
+	var status unix.WaitStatus
+	if got, err := unix.Wait4(pid, &status, unix.WALL|unix.WNOHANG, nil); !errors.Is(err, unix.ECHILD) {
+		t.Fatalf("PID %d remained waitable: pid=%d status=%#x error=%v", pid, got, uint32(status), err)
+	}
+}
+
+func coreSymbol(t *testing.T, path, name string) target.Address {
+	t.Helper()
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	symbols, err := f.Symbols()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, symbol := range symbols {
+		if symbol.Name == name {
+			return target.Address(symbol.Value)
+		}
+	}
+	t.Fatalf("missing fixture symbol %q", name)
+	return 0
+}
 
 func coreTempDir(t *testing.T) string {
 	t.Helper()
@@ -46,12 +136,14 @@ func coreFixture(t *testing.T) string {
 #include <string.h>
 #include <unistd.h>
 static void *spin(void *p) { for (;;) __asm__ volatile(""); return p; }
+__attribute__((noinline)) void core_checkpoint(void) { __asm__ volatile("nop"); }
 int main(int n, char **v) {
     if (n > 1 && !strcmp(v[1], "exit")) return 7;
     if (n > 1 && !strcmp(v[1], "exec")) { execl(v[0], v[0], "exit", (char *)0); return 99; }
     if (n > 1 && (!strcmp(v[1], "thread") || !strcmp(v[1], "readythread"))) {
         pthread_t t;
         if (pthread_create(&t, 0, spin, 0)) return 98;
+        core_checkpoint();
         if (!strcmp(v[1], "readythread")) { puts("ready"); fflush(stdout); }
     }
     if (n > 1 && !strcmp(v[1], "fork")) { if (fork() < 0) return 97; }
@@ -61,7 +153,9 @@ int main(int n, char **v) {
 	if err := os.WriteFile(source, []byte(code), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("cc", "-O0", "-pthread", "-o", path, source).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "cc", "-O0", "-no-pie", "-pthread", "-o", path, source).CombinedOutput(); err != nil {
 		t.Fatalf("compile fixture: %v\n%s", err, out)
 	}
 	return path
@@ -100,18 +194,18 @@ func TestCoreExitAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
+		if err := coreClose(t, s); err != nil {
 			t.Error(err)
 		}
 	})
-	stop, err := s.Continue(target.Signal{})
+	stop, err := coreContinue(t, s)
 	if err != nil || stop.Reason != target.StopExited || stop.ExitCode == nil || *stop.ExitCode != 7 {
 		t.Fatalf("exit stop=%+v error=%v", stop, err)
 	}
 	if _, err := s.Step(target.Signal{}); !errors.Is(err, target.ErrExited) {
 		t.Fatalf("step after exit: %v", err)
 	}
-	if err := s.Close(); err != nil {
+	if err := coreClose(t, s); err != nil {
 		t.Fatal(err)
 	}
 	if s.State() != target.StateClosed {
@@ -122,45 +216,161 @@ func TestCoreExitAndClose(t *testing.T) {
 	}
 }
 
-func TestCoreRejectsTaskAndImageChanges(t *testing.T) {
+func TestCoreTaskAndImageChanges(t *testing.T) {
 	path := coreFixture(t)
-	for _, tc := range []struct {
-		mode   string
-		reason target.StopReason
-	}{
-		{"thread", target.StopClone}, {"fork", target.StopFork}, {"exec", target.StopExec},
-	} {
-		t.Run(tc.mode, func(t *testing.T) {
-			s, err := Launch(path, tc.mode)
+	for _, mode := range []string{"thread", "fork", "exec"} {
+		t.Run(mode, func(t *testing.T) {
+			s, err := Launch(path, mode)
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() {
-				if err := s.Close(); err != nil {
-					t.Error(err)
+			coreOwnSession(t, s)
+			before, err := s.Snapshot()
+			if err != nil || len(before.Threads) != 1 {
+				t.Fatalf("initial snapshot=%+v error=%v", before, err)
+			}
+			switch mode {
+			case "thread":
+				address := coreSymbol(t, path, "core_checkpoint")
+				var original, patched, restored [1]byte
+				if n, err := s.ReadMemory(address, original[:]); err != nil || n != 1 {
+					t.Fatalf("original instruction: n=%d error=%v", n, err)
 				}
-			})
-			stop, err := s.Continue(target.Signal{})
-			if !errors.Is(err, target.ErrUnsupported) || stop.Reason != tc.reason {
-				t.Fatalf("unsupported stop=%+v error=%v", stop, err)
+				if err := s.AddBreakpoint(address); err != nil {
+					t.Fatal(err)
+				}
+				run, err := s.Run(target.RunRequest{Threads: target.ThreadSet{Scope: target.ProcessThreads, Process: before.Process}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := coreWait(t, run)
+				if err != nil || result.Stop.Reason != target.StopBreakpoint || result.Stop.Breakpoint == nil || *result.Stop.Breakpoint != address {
+					t.Fatalf("thread creation run=%+v error=%v", result, err)
+				}
+				after, err := s.Snapshot()
+				if err != nil || after.State != target.StateStopped || after.Process != before.Process || len(after.Threads) != 2 || after.Memory.Space != before.Memory.Space {
+					t.Fatalf("thread closure=%+v error=%v", after, err)
+				}
+				seen := make(map[target.ThreadRef]bool)
+				for _, info := range after.Threads {
+					if seen[info.Ref] || info.Ref.ID == 0 || info.Process != before.Process || info.State != target.StateStopped || info.Listening || info.Exiting {
+						t.Fatalf("thread identity=%+v", info)
+					}
+					seen[info.Ref] = true
+					if registers, err := s.ReadThreadRegisters(info.Token); err != nil || len(registers) == 0 {
+						t.Fatalf("thread %d registers=%v error=%v", info.TID, registers, err)
+					}
+				}
+				if !seen[before.Threads[0].Ref] || result.Thread != before.Threads[0].Ref {
+					t.Fatalf("leader identity changed: before=%+v result=%+v after=%+v", before.Threads[0], result, after.Threads)
+				}
+				if _, err := s.ReadRegisters(); !errors.Is(err, target.ErrAmbiguous) {
+					t.Fatalf("implicit thread selection: %v", err)
+				}
+				if n, err := s.ReadMemory(address, patched[:]); err != nil || n != 1 || patched[0] != 0xcc {
+					t.Fatalf("armed instruction=%x n=%d error=%v", patched, n, err)
+				}
+				if err := s.RemoveBreakpoint(address); err != nil {
+					t.Fatal(err)
+				}
+				if n, err := s.ReadMemory(address, restored[:]); err != nil || n != 1 || restored != original {
+					t.Fatalf("restored instruction=%x want=%x n=%d error=%v", restored, original, n, err)
+				}
+			case "fork":
+				stop, err := coreContinue(t, s)
+				if !errors.Is(err, target.ErrUnsupported) || stop.Reason != target.StopFork {
+					t.Fatalf("unsupported stop=%+v error=%v", stop, err)
+				}
+				if _, err := s.ReadRegisters(); !errors.Is(err, target.ErrUnsupported) {
+					t.Fatalf("data after unsupported: %v", err)
+				}
+				after, err := s.Snapshot()
+				if err != nil || after.State != target.StateStopped || len(after.Threads) != 2 {
+					t.Fatalf("fork closure=%+v error=%v", after, err)
+				}
+				for _, info := range after.Threads {
+					if info.State != target.StateStopped || info.Process.ID == 0 {
+						t.Fatalf("fork ownership=%+v", info)
+					}
+				}
+				if err := coreClose(t, s); err != nil {
+					t.Fatal(err)
+				}
+				for _, info := range after.Threads {
+					coreReaped(t, info.TID)
+				}
+			case "exec":
+				stop, err := coreContinue(t, s)
+				if err != nil || stop.Reason != target.StopExec || stop.RawPC != nil {
+					t.Fatalf("exec stop=%+v error=%v", stop, err)
+				}
+				after, err := s.Snapshot()
+				if err != nil || len(after.Threads) != 1 || after.Process != before.Process || after.Threads[0].Ref != before.Threads[0].Ref || after.Memory.Space == before.Memory.Space {
+					t.Fatalf("exec identity=%+v before=%+v error=%v", after, before, err)
+				}
+				if _, err := s.ReadThreadRegisters(before.Threads[0].Token); !errors.Is(err, target.ErrStale) {
+					t.Fatalf("pre-exec register token: %v", err)
+				}
+				if _, err := s.ReadSpaceMemory(before.Memory, 0, nil); !errors.Is(err, target.ErrStale) {
+					t.Fatalf("pre-exec memory token: %v", err)
+				}
+				if _, err := s.ReadThreadRegisters(after.Threads[0].Token); err != nil {
+					t.Fatalf("new image registers: %v", err)
+				}
+				stop, err = coreContinue(t, s)
+				if err != nil || stop.Reason != target.StopExited || stop.ExitCode == nil || *stop.ExitCode != 7 {
+					t.Fatalf("new image exit=%+v error=%v", stop, err)
+				}
 			}
-			if _, err := s.ReadRegisters(); !errors.Is(err, target.ErrUnsupported) {
-				t.Fatalf("data after unsupported: %v", err)
-			}
-			if err := s.Close(); err != nil {
+			if err := coreClose(t, s); err != nil {
 				t.Fatal(err)
 			}
+			coreReaped(t, s.PID())
 		})
+	}
+}
+
+func TestCoreLegacyRunStopsAtThreadCreation(t *testing.T) {
+	s, err := Launch(coreFixture(t), "thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	coreOwnSession(t, s)
+	stop, err := coreContinue(t, s)
+	if !errors.Is(err, target.ErrAmbiguous) || stop.Reason != target.StopClone {
+		t.Fatalf("legacy thread creation stop=%+v error=%v", stop, err)
+	}
+	snapshot, err := s.Snapshot()
+	if err != nil || snapshot.State != target.StateStopped || len(snapshot.Threads) != 2 {
+		t.Fatalf("legacy thread closure=%+v error=%v", snapshot, err)
+	}
+	for _, info := range snapshot.Threads {
+		if info.State != target.StateStopped || info.Process != snapshot.Process {
+			t.Fatalf("newborn state=%+v", info)
+		}
+		if _, err := s.ReadThreadRegisters(info.Token); err != nil {
+			t.Fatalf("newborn register access: %v", err)
+		}
+	}
+	if _, err := coreContinue(t, s); !errors.Is(err, target.ErrAmbiguous) {
+		t.Fatalf("legacy resume after clone: %v", err)
 	}
 }
 
 func startUntraced(t *testing.T, path, mode string) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command(path, mode)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, path, mode)
 	if err := cmd.Start(); err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	t.Cleanup(func() {
+		cancel()
+		if _, err := coreCall(t, func() (struct{}, error) { return struct{}{}, cmd.Wait() }); errors.Is(err, context.DeadlineExceeded) {
+			t.Error(err)
+		}
+	})
 	return cmd
 }
 
@@ -171,7 +381,7 @@ func TestCoreAttachAndDetach(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
+		if err := coreClose(t, s); err != nil {
 			t.Error(err)
 		}
 	})
@@ -181,7 +391,7 @@ func TestCoreAttachAndDetach(t *testing.T) {
 	if _, err := s.ReadRegisters(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close(); err != nil {
+	if err := coreClose(t, s); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmd.Process.Signal(unix.Signal(0)); err != nil {
@@ -189,25 +399,85 @@ func TestCoreAttachAndDetach(t *testing.T) {
 	}
 }
 
-func TestCoreAttachRejectsMultipleThreads(t *testing.T) {
-	cmd := exec.Command(coreFixture(t), "readythread")
+func TestCoreAttachSupportsMultipleThreads(t *testing.T) {
+	path := coreFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, path, "readythread")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cancel()
 		t.Fatal(err)
 	}
 	if err := cmd.Start(); err != nil {
+		cancel()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
-	line, err := bufio.NewReader(stdout).ReadString('\n')
+	t.Cleanup(func() {
+		cancel()
+		if _, err := coreCall(t, func() (struct{}, error) { return struct{}{}, cmd.Wait() }); errors.Is(err, context.DeadlineExceeded) {
+			t.Error(err)
+		}
+	})
+	line, err := coreCall(t, func() (string, error) { return bufio.NewReader(stdout).ReadString('\n') })
 	if err != nil || line != "ready\n" {
 		t.Fatalf("fixture readiness %q: %v", line, err)
 	}
-	if _, err := Attach(cmd.Process.Pid); !errors.Is(err, target.ErrUnsupported) {
+	s, err := Attach(cmd.Process.Pid)
+	if err != nil {
 		t.Fatalf("multi-thread attach: %v", err)
 	}
+	coreOwnSession(t, s)
+	snapshot, err := s.Snapshot()
+	if err != nil || snapshot.State != target.StateStopped || len(snapshot.Threads) != 2 {
+		t.Fatalf("attach closure=%+v error=%v", snapshot, err)
+	}
+	tracer, err := call(s, func(e *engine) (int, error) { return unix.Gettid(), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, info := range snapshot.Threads {
+		if info.State != target.StateStopped || info.Process != snapshot.Process || info.Ref.ID == 0 || info.Token.Stop == 0 {
+			t.Fatalf("attached thread=%+v", info)
+		}
+		status, err := readTaskStatus(info.TID)
+		if err != nil || status.tgid != s.PID() || status.tracer != tracer {
+			t.Fatalf("attached kernel ownership=%+v error=%v", status, err)
+		}
+		if _, err := s.ReadThreadRegisters(info.Token); err != nil {
+			t.Fatalf("attached thread registers: %v", err)
+		}
+	}
+	if snapshot.Threads[0].Ref == snapshot.Threads[1].Ref {
+		t.Fatal("distinct tasks share a thread identity")
+	}
+	address := coreSymbol(t, path, "core_checkpoint")
+	var original [1]byte
+	if n, err := s.ReadMemory(address, original[:]); err != nil || n != 1 {
+		t.Fatalf("original instruction: n=%d error=%v", n, err)
+	}
+	if err := s.AddBreakpoint(address); err != nil {
+		t.Fatal(err)
+	}
+	if err := coreClose(t, s); err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Process.Signal(unix.Signal(0)); err != nil {
-		t.Fatalf("rejected attach killed target: %v", err)
+		t.Fatalf("attach close killed target: %v", err)
+	}
+	for _, info := range snapshot.Threads {
+		status, err := readTaskStatus(info.TID)
+		if err != nil || status.tracer != 0 || status.tgid != cmd.Process.Pid {
+			t.Fatalf("detached kernel ownership=%+v error=%v", status, err)
+		}
+	}
+	reopened, err := Attach(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("reattach after multi-thread close: %v", err)
+	}
+	coreOwnSession(t, reopened)
+	var restored [1]byte
+	if n, err := reopened.ReadMemory(address, restored[:]); err != nil || n != 1 || restored != original {
+		t.Fatalf("detach instruction restoration=%x want=%x n=%d error=%v", restored, original, n, err)
 	}
 }
 
@@ -216,15 +486,42 @@ func TestCoreAttachPreservesGroupStop(t *testing.T) {
 	if err := cmd.Process.Signal(unix.SIGSTOP); err != nil {
 		t.Fatal(err)
 	}
-	var ws unix.WaitStatus
-	if _, err := unix.Wait4(cmd.Process.Pid, &ws, unix.WUNTRACED, nil); err != nil {
+	ws, err := coreCall(t, func() (unix.WaitStatus, error) {
+		var status unix.WaitStatus
+		_, err := unix.Wait4(cmd.Process.Pid, &status, unix.WUNTRACED, nil)
+		return status, err
+	})
+	if err != nil || !ws.Stopped() || ws.StopSignal() != unix.SIGSTOP {
+		t.Fatalf("initial group stop=%v error=%v", ws, err)
+	}
+	s, err := Attach(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("group-stop attach: %v", err)
+	}
+	coreOwnSession(t, s)
+	if stop := s.LastStop(); stop.Reason != target.StopGroupStop {
+		t.Fatalf("attached group stop=%+v", stop)
+	}
+	snapshot, err := s.Snapshot()
+	if err != nil || len(snapshot.Threads) != 1 || !snapshot.Threads[0].GroupStopped || snapshot.Threads[0].State != target.StateStopped {
+		t.Fatalf("attached group-stop snapshot=%+v error=%v", snapshot, err)
+	}
+	if _, err := s.Step(target.Signal{}); !errors.Is(err, target.ErrUnsupported) {
+		t.Fatalf("instruction step through group stop: %v", err)
+	}
+	run, err := s.Run(target.RunRequest{Threads: target.ThreadSet{Scope: target.ProcessThreads, Process: snapshot.Process}})
+	if err != nil {
+		t.Fatalf("group-stop listen: %v", err)
+	}
+	snapshot, err = s.Snapshot()
+	if err != nil || len(snapshot.Threads) != 1 || !snapshot.Threads[0].Listening || !snapshot.Threads[0].GroupStopped {
+		t.Fatalf("listening group-stop snapshot=%+v error=%v", snapshot, err)
+	}
+	if err := coreClose(t, s); err != nil {
 		t.Fatal(err)
 	}
-	if !ws.Stopped() {
-		t.Fatalf("initial state: %v", ws)
-	}
-	if _, err := Attach(cmd.Process.Pid); !errors.Is(err, target.ErrUnsupported) {
-		t.Fatalf("group-stop attach: %v", err)
+	if _, err := coreWait(t, run); !errors.Is(err, target.ErrDetached) {
+		t.Fatalf("listening run after detach: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -240,45 +537,90 @@ func TestCoreAttachPreservesGroupStop(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
+	status, err := readTaskStatus(cmd.Process.Pid)
+	if err != nil || status.tracer != 0 {
+		t.Fatalf("group-stop detach ownership=%+v error=%v", status, err)
+	}
 }
 
 func TestCoreChildExitCompletesUnsupported(t *testing.T) {
-	s := &Session{pid: 41}
-	s.state.Store(uint32(target.StateStopped))
-	reply := make(chan response[target.Stop], 1)
+	s := &Session{id: 1, pid: 41}
+	s.state.Store(uint32(target.StateRunning))
+	e := &engine{s: s, unsupported: target.ErrUnsupported}
+	p := e.newProcess(41, -1, true)
+	e.primary = p
+	e.life.births = map[int]*birth{43: {parent: p}}
+	parent := e.newThread(p, 41, true)
+	parent.state, parent.stopEpoch = target.StateStopped, 1
+	child := e.newThread(nil, 42, true)
 	stop := target.Stop{Reason: target.StopClone}
-	e := &engine{
-		s:            s,
-		tasks:        map[int]*task{41: {pid: 41, tgid: 41, stopped: true}, 42: {pid: 42, waiting: true}},
-		deferredStop: &stop,
-		unsupported:  target.ErrUnsupported,
-		run:          &runOperation{reply: reply},
-	}
+	run := newRun(1)
+	e.run = &runOperation{handle: run}
+	e.barrier = &stopBarrier{thread: parent, stop: stop, err: target.ErrUnsupported}
 	e.handleWait(waitResult{pid: 42, status: unix.WaitStatus(unix.SIGKILL)})
+	if child.state != target.StateExited || e.barrier == nil || e.run == nil || len(e.life.births) != 1 {
+		t.Fatal("child terminal lost the pending ownership barrier")
+	}
 	select {
-	case result := <-reply:
-		if result.value.Reason != target.StopClone || !errors.Is(result.err, target.ErrUnsupported) {
-			t.Fatalf("result=%+v", result)
-		}
+	case <-run.done:
+		t.Fatal("unresolved ownership completed the pending run")
+	default:
+	}
+	if s.LastStop().Reason != target.StopUnknown {
+		t.Fatalf("unresolved ownership published a stop: %+v", s.LastStop())
+	}
+	delete(e.life.births, 43)
+	e.completeBarrier()
+	select {
+	case <-run.done:
 	default:
 		t.Fatal("child terminal did not resolve the pending run")
+	}
+	result, err := coreWait(t, run)
+	if result.Stop.Reason != target.StopClone || result.Thread != parent.ref || err != target.ErrUnsupported {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if child.state != target.StateExited || parent.state != target.StateStopped || e.run != nil || e.barrier != nil || s.State() != target.StateStopped {
+		t.Fatalf("terminal closure: parent=%+v child=%+v state=%v", parent, child, s.State())
+	}
+	if result.Sequence == 0 || result.Sequence != s.LastStop().Generation {
+		t.Fatalf("completed stop sequence=%d last=%+v", result.Sequence, s.LastStop())
 	}
 }
 
 func TestCoreTerminalDoesNotRepublishOldStop(t *testing.T) {
-	s := &Session{pid: 41}
-	s.state.Store(uint32(target.StateStopped))
-	stop := target.Stop{Reason: target.StopFork}
-	e := &engine{
-		s:            s,
-		tasks:        map[int]*task{41: {pid: 41, tgid: 41, waiting: true}, 42: {pid: 42, waiting: true}},
-		deferredStop: &stop,
-		unsupported:  target.ErrUnsupported,
-	}
+	s := &Session{id: 1, pid: 41}
+	s.state.Store(uint32(target.StateRunning))
+	e := &engine{s: s, unsupported: target.ErrUnsupported}
+	p := e.newProcess(41, -1, true)
+	e.primary = p
+	parent := e.newThread(p, 41, true)
+	child := e.newThread(p, 42, true)
+	e.barrier = &stopBarrier{thread: parent, stop: target.Stop{Reason: target.StopFork}, err: target.ErrUnsupported}
 	e.handleWait(waitResult{pid: 41, status: unix.WaitStatus(unix.SIGKILL)})
+	if e.barrier == nil || child.state == target.StateExited {
+		t.Fatal("terminal barrier completed before all owned tasks exited")
+	}
 	e.handleWait(waitResult{pid: 42, status: unix.WaitStatus(unix.SIGKILL)})
-	if s.State() != target.StateExited || s.LastStop().Reason != target.StopSignaled {
-		t.Fatalf("state=%v last=%+v", s.State(), s.LastStop())
+	last := s.LastStop()
+	if s.State() != target.StateExited || last.Reason != target.StopSignaled || last.Signal.Number != uint32(unix.SIGKILL) || last.ThreadID == nil || *last.ThreadID != 42 || last.Generation == 0 {
+		t.Fatalf("state=%v last=%+v", s.State(), last)
+	}
+	if e.barrier != nil || e.run != nil {
+		t.Fatal("terminal completion retained an old barrier")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var sequence uint64
+	for sequence < last.Generation {
+		event, err := s.NextEvent(ctx, sequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.Stop.Reason == target.StopFork {
+			t.Fatalf("old stop was republished: %+v", event)
+		}
+		sequence = event.Sequence
 	}
 }
 
@@ -333,7 +675,7 @@ func TestCoreELFProfiles(t *testing.T) {
 func TestCoreBreakpointAddressWidths(t *testing.T) {
 	for _, profile := range []arch.Descriptor{amd64.Descriptor(), x86.Descriptor()} {
 		t.Run(string(profile.Architecture), func(t *testing.T) {
-			e := &engine{profile: &profile}
+			e := &engine{primary: &process{profile: &profile}}
 			maximum, err := profile.MaxAddress()
 			if err != nil {
 				t.Fatal(err)
@@ -361,25 +703,73 @@ func TestCoreBreakpointAddressWidths(t *testing.T) {
 }
 
 func TestCoreExecInvalidatesBeforeRegisterDecode(t *testing.T) {
-	s := &Session{pid: 41}
-	s.state.Store(uint32(target.StateRunning))
-	address := target.Address(0x401000)
-	bp := &breakpoint{addr: address, original: 0x90, armed: true}
-	reply := make(chan response[target.Stop], 1)
-	e := &engine{
-		s:           s,
-		tasks:       map[int]*task{41: {pid: 41, tgid: 41, waiting: true}},
-		breakpoints: map[target.Address]*breakpoint{address: bp},
-		hit:         &address, suspended: bp, run: &runOperation{reply: reply, over: bp},
+	to, entry := coreAssembly(t, 32, ".text\n.global _start\n_start:\n nop\n jmp _start\n")
+	body := ".text\n.global _start\n.global exec_site\n_start:\n mov $59, %eax\n lea destination(%rip), %rdi\n xor %esi, %esi\n xor %edx, %edx\nexec_site:\n syscall\n ud2\n"
+	from, _ := coreAssembly(t, 64, body+fmt.Sprintf(".section .rodata\ndestination: .asciz %q\n", to))
+	s, err := Launch(from)
+	if err != nil {
+		t.Fatal(err)
 	}
-	status := unix.WaitStatus(unix.PTRACE_EVENT_EXEC<<16 | int(unix.SIGTRAP)<<8 | 0x7f)
-	e.handleWait(waitResult{pid: 41, status: status})
-	result := <-reply
-	if result.value.Reason != target.StopExec || result.value.RawPC != nil || !errors.Is(result.err, target.ErrUnsupported) {
-		t.Fatalf("exec=%+v error=%v", result.value, result.err)
+	coreOwnSession(t, s)
+	address := coreSymbol(t, from, "exec_site")
+	if err := s.AddBreakpoint(address); err != nil {
+		t.Fatal(err)
 	}
-	if len(e.breakpoints) != 0 || e.hit != nil || e.suspended != nil {
-		t.Fatal("old image breakpoint state survived exec")
+	stop, err := coreContinue(t, s)
+	if err != nil || stop.Reason != target.StopBreakpoint || stop.Breakpoint == nil || *stop.Breakpoint != address {
+		t.Fatalf("exec syscall breakpoint=%+v error=%v", stop, err)
+	}
+	before, err := s.Snapshot()
+	if err != nil || len(before.Threads) != 1 {
+		t.Fatalf("pre-exec snapshot=%+v error=%v", before, err)
+	}
+	oldSpace, err := call(s, func(e *engine) (*addressSpace, error) { return e.primary.space, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop, err = coreContinue(t, s)
+	if err != nil || stop.Reason != target.StopExec || stop.RawPC != nil {
+		t.Fatalf("exec during breakpoint step=%+v error=%v", stop, err)
+	}
+	clean, err := call(s, func(e *engine) (bool, error) {
+		owner := e.threads[e.s.pid]
+		return e.primary.profile.Architecture == target.X86 && e.primary.space != oldSpace &&
+			len(e.primary.space.breakpoints) == 0 && e.primary.space.stepping == nil &&
+			len(oldSpace.breakpoints) == 0 && oldSpace.stepping == nil &&
+			owner.hit == nil && owner.suspended == nil && e.run == nil && e.barrier == nil && e.unsupported == nil, nil
+	})
+	if err != nil || !clean {
+		t.Fatalf("old image breakpoint/step state survived exec: clean=%v error=%v", clean, err)
+	}
+	after, err := s.Snapshot()
+	if err != nil || after.Architecture != target.X86 || len(after.Threads) != 1 || after.Process != before.Process || after.Threads[0].Ref != before.Threads[0].Ref || after.Memory.Space == before.Memory.Space {
+		t.Fatalf("post-exec identity=%+v before=%+v error=%v", after, before, err)
+	}
+	if _, err := s.ReadThreadRegisters(before.Threads[0].Token); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("old register token: %v", err)
+	}
+	if _, err := s.ReadSpaceMemory(before.Memory, address, nil); !errors.Is(err, target.ErrStale) {
+		t.Fatalf("old address-space token: %v", err)
+	}
+	registers, err := s.ReadThreadRegisters(after.Threads[0].Token)
+	if err != nil {
+		t.Fatalf("register decode after image replacement: %v", err)
+	}
+	found := false
+	for _, register := range registers {
+		if register.Name == "eip" {
+			found = register.Available && register.Bits == 32 && len(register.Data) == 4 && target.Address(binary.LittleEndian.Uint32(register.Data)) == entry
+		}
+	}
+	if !found {
+		t.Fatalf("new image PC not decoded with i386 profile: %+v", registers)
+	}
+	var instruction [1]byte
+	if n, err := s.ReadMemory(entry, instruction[:]); err != nil || n != 1 || instruction[0] != 0x90 {
+		t.Fatalf("new image instruction=%x n=%d error=%v", instruction, n, err)
+	}
+	if err := s.RemoveBreakpoint(address); !errors.Is(err, target.ErrNotFound) {
+		t.Fatalf("old image breakpoint lookup: %v", err)
 	}
 }
 
@@ -390,14 +780,16 @@ func coreAssembly(t *testing.T, bits int, code string) (string, target.Address) 
 	if err := os.WriteFile(source, []byte(code), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("as", fmt.Sprintf("--%d", bits), "-o", object, source).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "as", fmt.Sprintf("--%d", bits), "-o", object, source).CombinedOutput(); err != nil {
 		t.Fatalf("assemble: %v\n%s", err, out)
 	}
 	emulation := "elf_x86_64"
 	if bits == 32 {
 		emulation = "elf_i386"
 	}
-	if out, err := exec.Command("ld", "-m", emulation, "-o", path, object).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "ld", "-m", emulation, "-o", path, object).CombinedOutput(); err != nil {
 		t.Fatalf("link: %v\n%s", err, out)
 	}
 	f, err := elf.Open(path)
@@ -415,7 +807,7 @@ func TestCoreExecArchitectureChanges(t *testing.T) {
 			if bits == 64 {
 				toBits = 32
 			}
-			to, _ := coreAssembly(t, toBits, ".text\n.global _start\n_start:\n nop\n jmp _start\n")
+			to, destination := coreAssembly(t, toBits, ".text\n.global _start\n_start:\n nop\n jmp _start\n")
 			body := "mov $11, %eax\n mov $destination, %ebx\n xor %ecx, %ecx\n xor %edx, %edx\n int $0x80\n ud2\n"
 			want := target.X86
 			if bits == 64 {
@@ -428,31 +820,71 @@ func TestCoreExecArchitectureChanges(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() {
-				if err := s.Close(); err != nil {
+				if err := coreClose(t, s); err != nil {
 					t.Error(err)
 				}
 			})
 			if s.Architecture() != want {
 				t.Fatalf("architecture=%s", s.Architecture())
 			}
+			before, err := s.Snapshot()
+			if err != nil || len(before.Threads) != 1 {
+				t.Fatalf("initial snapshot=%+v error=%v", before, err)
+			}
 			if err := s.AddBreakpoint(entry); err != nil {
 				t.Fatal(err)
 			}
-			stop, err := s.Continue(target.Signal{})
+			stop, err := coreContinue(t, s)
 			if err != nil || stop.Reason != target.StopBreakpoint {
 				t.Fatalf("first stop=%+v error=%v", stop, err)
 			}
-			stop, err = s.Continue(target.Signal{})
-			if !errors.Is(err, target.ErrUnsupported) || stop.Reason != target.StopExec || stop.RawPC != nil {
+			stop, err = coreContinue(t, s)
+			if err != nil || stop.Reason != target.StopExec || stop.RawPC != nil {
 				t.Fatalf("exec stop=%+v error=%v", stop, err)
 			}
-			count, err := call(s, func(e *engine) (int, error) { return len(e.breakpoints), nil })
+			count, err := call(s, func(e *engine) (int, error) { return len(e.primary.space.breakpoints), nil })
 			if err != nil || count != 0 {
 				t.Fatalf("old breakpoints=%d error=%v", count, err)
 			}
-			if err := s.Close(); err != nil {
+			want = target.AMD64
+			if toBits == 32 {
+				want = target.X86
+			}
+			after, err := s.Snapshot()
+			if err != nil || after.Architecture != want || s.Architecture() != want || len(after.Threads) != 1 || after.Process != before.Process || after.Threads[0].Ref != before.Threads[0].Ref || after.Memory.Space == before.Memory.Space {
+				t.Fatalf("changed architecture snapshot=%+v error=%v", after, err)
+			}
+			registers, err := s.ReadThreadRegisters(after.Threads[0].Token)
+			if err != nil || len(registers) == 0 {
+				t.Fatalf("changed architecture registers=%+v error=%v", registers, err)
+			}
+			if _, err := s.ReadThreadRegisters(before.Threads[0].Token); !errors.Is(err, target.ErrStale) {
+				t.Fatalf("old register token: %v", err)
+			}
+			if _, err := s.ReadSpaceMemory(before.Memory, entry, nil); !errors.Is(err, target.ErrStale) {
+				t.Fatalf("old memory token: %v", err)
+			}
+			var instruction [1]byte
+			if n, err := s.ReadMemory(destination, instruction[:]); err != nil || n != 1 || instruction[0] != 0x90 {
+				t.Fatalf("new image instruction=%x n=%d error=%v", instruction, n, err)
+			}
+			if err := s.AddBreakpoint(destination); err != nil {
 				t.Fatal(err)
 			}
+			stop, err = coreContinue(t, s)
+			if err != nil || stop.Reason != target.StopBreakpoint || stop.Breakpoint == nil || *stop.Breakpoint != destination {
+				t.Fatalf("new image breakpoint=%+v error=%v", stop, err)
+			}
+			if err := s.RemoveBreakpoint(destination); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := s.ReadMemory(destination, instruction[:]); err != nil || n != 1 || instruction[0] != 0x90 {
+				t.Fatalf("new image instruction restoration=%x n=%d error=%v", instruction, n, err)
+			}
+			if err := coreClose(t, s); err != nil {
+				t.Fatal(err)
+			}
+			coreReaped(t, s.PID())
 		})
 	}
 }
@@ -464,21 +896,21 @@ func TestCoreForkOwnershipBeforeRegisterViewRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
+		if err := coreClose(t, s); err != nil {
 			t.Error(err)
 		}
 	})
-	stop, err := s.Continue(target.Signal{})
+	stop, err := coreContinue(t, s)
 	if !errors.Is(err, target.ErrUnsupported) || stop.Reason != target.StopFork || stop.RawPC != nil {
 		t.Fatalf("fork stop=%+v error=%v", stop, err)
 	}
 	child, err := call(s, func(e *engine) (int, error) {
-		if len(e.tasks) != 2 || !e.allStopped() {
+		if len(e.threads) != 2 || !e.allStopped() {
 			return 0, target.ErrInvalidState
 		}
-		for pid, task := range e.tasks {
+		for pid, thread := range e.threads {
 			if pid != e.s.pid {
-				if _, ok := e.groups[task.tgid]; !ok {
+				if thread.process == nil || e.processes[thread.process.tgid] != thread.process || !thread.process.owned || thread.process.pidfd < 0 {
 					return 0, target.ErrUnavailable
 				}
 				return pid, nil
@@ -489,7 +921,7 @@ func TestCoreForkOwnershipBeforeRegisterViewRejection(t *testing.T) {
 	if err != nil || child <= 0 {
 		t.Fatalf("child ownership=%d error=%v", child, err)
 	}
-	if err := s.Close(); err != nil {
+	if err := coreClose(t, s); err != nil {
 		t.Fatal(err)
 	}
 	var ws unix.WaitStatus

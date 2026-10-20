@@ -85,6 +85,8 @@ const (
 	StopFork
 	StopVFork
 	StopAttach
+	StopGroupStop
+	StopWatchpoint
 )
 
 func (r StopReason) String() string {
@@ -111,20 +113,27 @@ func (r StopReason) String() string {
 		return "vfork"
 	case StopAttach:
 		return "attach"
+	case StopGroupStop:
+		return "group-stop"
+	case StopWatchpoint:
+		return "watchpoint"
 	default:
 		return "unknown"
 	}
 }
 
 type Stop struct {
-	Reason     StopReason
-	ThreadID   *uint64
-	RawPC      *Address
-	Signal     Signal
-	ExitCode   *int
-	Breakpoint *Address
-	Generation uint64
-	Raw        string
+	Reason        StopReason
+	ThreadID      *uint64
+	RawPC         *Address
+	Signal        Signal
+	ExitCode      *int
+	Breakpoint    *Address
+	Generation    uint64
+	Raw           string
+	Watchpoints   []WatchpointHit
+	StepCompleted bool
+	RawDR6        *uint64
 }
 
 type Register struct {
