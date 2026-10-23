@@ -8,6 +8,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type ptraceResumeError struct {
+	err error
+}
+
+func (e *ptraceResumeError) Error() string { return e.err.Error() }
+
+func (e *ptraceResumeError) Unwrap() error { return e.err }
+
 func signalNumber(signal target.Signal) (int, error) {
 	if signal.Domain == target.SignalNone && signal.Number == 0 {
 		return 0, nil
@@ -140,6 +148,9 @@ func (e *engine) startOperation(set target.ThreadSet, step *target.ThreadRef, si
 	}
 	for _, action := range op.actions {
 		t := action.thread
+		if t.syscall != nil && t.syscall.phase == syscallExit && t.syscall.restart && action.step {
+			return nil, fmt.Errorf("an interrupted syscall must be resumed before a new instruction step: %w", target.ErrUnsupported)
+		}
 		if _, pending := e.life.syscallSteps[t]; action.step && pending && e.life.cloneChildren[t] != nil {
 			return nil, fmt.Errorf("an interrupted clone instruction remains pending: %w", target.ErrUnsupported)
 		}
@@ -148,6 +159,9 @@ func (e *engine) startOperation(set target.ThreadSet, step *target.ThreadRef, si
 		}
 		if t.fault != nil {
 			return nil, t.fault
+		}
+		if t.extendedFault != nil {
+			return nil, t.extendedFault
 		}
 		if watchpoints := t.watchpoints; watchpoints != nil {
 			if watchpoints.fault != nil {
@@ -172,6 +186,9 @@ func (e *engine) startOperation(set target.ThreadSet, step *target.ThreadRef, si
 		}
 		if t.groupStopped && action.step {
 			return nil, fmt.Errorf("stepping a group-stopped thread: %w", target.ErrUnsupported)
+		}
+		if t.groupStopped && t.syscall != nil {
+			return nil, fmt.Errorf("a breakpoint syscall is pending in group-stop: %w", target.ErrUnsupported)
 		}
 	}
 	seen := make(map[target.ThreadRef]bool, len(signals))
@@ -204,6 +221,9 @@ func (e *engine) startOperation(set target.ThreadSet, step *target.ThreadRef, si
 		if action.step && action.thread.needsUserBoundary && action.signal != 0 {
 			return nil, fmt.Errorf("instruction step across a kernel-return boundary cannot deliver a signal: %w", target.ErrUnsupported)
 		}
+		if action.thread.syscall != nil && action.thread.syscall.phase != syscallExit && action.signal != 0 {
+			return nil, fmt.Errorf("signal delivery while a breakpoint syscall is pending: %w", target.ErrUnsupported)
+		}
 	}
 	e.nextRun++
 	op.handle = newRun(e.nextRun)
@@ -216,14 +236,8 @@ func (e *engine) threadStepping(t *thread) bool {
 	if e.run == nil {
 		return false
 	}
-	if e.run.entryThread == t {
-		return false
-	}
-	if e.run.overThread == t {
-		return true
-	}
 	action := e.run.actions[t.ref]
-	return action != nil && action.step && action.started
+	return action != nil && action.started && action.mode == resumeStep
 }
 
 func (e *engine) advanceRun() {
@@ -251,14 +265,14 @@ func (e *engine) advanceRun() {
 				return
 			}
 			if err := e.resumeThread(action, true); err != nil {
-				e.beginBarrier(t, t.stop, err)
+				e.resumeFailed(action, err)
 			}
 		}
 		return
 	}
 	for _, t := range e.sortedThreads() {
 		action := e.run.actions[t.ref]
-		if action == nil || action.started || !action.step || !t.needsUserBoundary {
+		if action == nil || action.started || !action.step || !t.needsUserBoundary || t.syscall != nil {
 			continue
 		}
 		pc, err := e.readPC(t.tid)
@@ -273,7 +287,7 @@ func (e *engine) advanceRun() {
 		}
 		e.run.entryThread, e.run.entry, e.run.entryHit = t, bp, false
 		if err := e.resumeThread(action, false); err != nil {
-			e.beginBarrier(t, t.stop, err)
+			e.resumeFailed(action, err)
 		}
 		return
 	}
@@ -293,10 +307,13 @@ func (e *engine) advanceRun() {
 		if bp == nil {
 			continue
 		}
+		if _, err := e.prepareBreakpointSyscall(t, bp); err != nil {
+			e.beginBarrier(t, t.stop, err)
+			return
+		}
 		e.run.overThread, e.run.over = t, bp
 		if err := e.resumeThread(action, true); err != nil {
-			e.run.overThread, e.run.over = nil, nil
-			e.beginBarrier(t, t.stop, err)
+			e.resumeFailed(action, err)
 		}
 		return
 	}
@@ -306,15 +323,40 @@ func (e *engine) advanceRun() {
 			continue
 		}
 		if err := e.resumeThread(action, action.step); err != nil {
-			err = &target.PartialError{Op: "resume threads", Completed: e.run.resumeCount, Total: len(e.run.actions), Err: err}
-			e.beginBarrier(t, t.stop, err)
+			e.resumeFailed(action, err)
 			return
 		}
 	}
 }
 
+func (e *engine) resumeFailed(action *resumeAction, err error) {
+	t := action.thread
+	var failure *ptraceResumeError
+	if errors.As(err, &failure) && errors.Is(failure, unix.ESRCH) && t.seized && t.state == target.StateStopped {
+		action.resumeFailure = err
+		e.awaitOwnedWait(t)
+		return
+	}
+	if e.run != nil {
+		err = &target.PartialError{Op: "resume threads", Completed: e.run.resumeCount, Total: len(e.run.actions), Err: err}
+	}
+	e.beginBarrier(t, t.stop, err)
+}
+
+func (e *engine) awaitOwnedWait(t *thread) {
+	t.state, t.listening = target.StateUnknown, false
+	e.registersChanged(t)
+	if t.process != nil && t.process.space != nil {
+		e.memoryChanged(t.process.space)
+	}
+	e.updateState()
+}
+
 func (e *engine) resumeThread(action *resumeAction, step bool) error {
 	t := action.thread
+	if t.extendedFault != nil {
+		return t.extendedFault
+	}
 	if t.state != target.StateStopped || t.listening || t.exiting || t.process == nil || t.process.space == nil {
 		return target.ErrInvalidState
 	}
@@ -324,7 +366,40 @@ func (e *engine) resumeThread(action *resumeAction, step bool) error {
 	}
 	var commit func()
 	var err error
-	if action.cloneStep {
+	syscallResume := false
+	if action.retry {
+		if action.mode == resumeNone || action.mode == resumeListen || action.signal != 0 {
+			return target.ErrInvalidState
+		}
+	} else if pending := t.syscall; pending != nil {
+		if pending.space != space.ref || t.groupStopped || action.cloneStep {
+			return target.ErrStale
+		}
+		if pending.phase != syscallExit && action.signal != 0 {
+			return target.ErrUnsupported
+		}
+		switch pending.phase {
+		case syscallEntering:
+			syscallResume = true
+			commit = func() { pending.needExit = pending.needExit || action.step }
+		case syscallParked:
+			syscallResume = pending.needExit || action.step
+			if syscallResume {
+				commit = func() { pending.needExit, pending.phase = true, syscallExecuting }
+			} else {
+				commit = func() { e.forgetBreakpointSyscall(t) }
+			}
+		case syscallExecuting:
+			syscallResume = true
+		case syscallExit:
+			if !pending.restart || action.step {
+				return target.ErrUnsupported
+			}
+			commit = func() { e.forgetBreakpointSyscall(t) }
+		default:
+			return target.ErrInvalidState
+		}
+	} else if action.cloneStep {
 		if !step || action.signal != 0 || t.stop.Reason != target.StopClone {
 			return target.ErrInvalidState
 		}
@@ -341,27 +416,46 @@ func (e *engine) resumeThread(action *resumeAction, step bool) error {
 	if err := e.prepareWatchpointResume(t); err != nil {
 		return err
 	}
-	listening := t.groupStopped && !step
-	if listening {
+	mode := action.mode
+	if !action.retry {
+		switch {
+		case t.groupStopped && !step && !syscallResume:
+			mode = resumeListen
+		case syscallResume:
+			mode = resumeSyscall
+		case step && t.syscall == nil:
+			mode = resumeStep
+		default:
+			mode = resumeContinue
+		}
+	}
+	switch mode {
+	case resumeListen:
 		if !t.seized || action.signal != 0 {
 			return target.ErrUnsupported
 		}
 		err = ptraceListen(t.tid)
-	} else if step {
+	case resumeSyscall:
+		err = unix.PtraceSyscall(t.tid, action.signal)
+	case resumeStep:
 		err = ptraceStep(t.tid, action.signal)
-	} else {
+	case resumeContinue:
 		err = unix.PtraceCont(t.tid, action.signal)
+	default:
+		return target.ErrInvalidState
 	}
 	if err != nil {
-		return err
+		return &ptraceResumeError{err: err}
 	}
 	if commit != nil {
 		commit()
 	}
-	t.state, t.listening = target.StateRunning, listening
+	t.state, t.listening = target.StateRunning, mode == resumeListen
 	t.pendingSignal = 0
 	t.interruptRequested = false
+	t.interruptResumed = t.interruptDeferred
 	action.signal, action.started = 0, true
+	action.mode, action.retry = mode, false
 	action.cloneStep = false
 	if e.run.overThread == t {
 		e.run.overPaused = false
@@ -399,9 +493,45 @@ func (e *engine) onThreadCreated(t *thread) {
 func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 	first := t.stopEpoch == 0
 	internalStep := t.internalStepTrap
+	wasInterrupted := t.interruptRequested
+	deferredInterrupt := t.interruptDeferred && t.interruptResumed && !wasInterrupted
+	t.interruptDeferred, t.interruptResumed = wasInterrupted, false
 	t.internalStepTrap = false
 	t.state, t.listening = target.StateStopped, false
 	t.interruptRequested = false
+	syscallEntryComplete := false
+	var syscallError error
+	if pending := t.syscall; pending != nil {
+		switch pending.phase {
+		case syscallEntry:
+			stop.Reason, stop.StepCompleted = target.StopUnknown, false
+			syscallError = e.finishBreakpointSyscallEntry(t)
+			if syscallError == nil {
+				syscallEntryComplete = true
+				if e.run != nil && e.run.overThread == t {
+					e.run.overThread, e.run.over, e.run.overPaused = nil, nil, false
+				}
+			} else {
+				e.unsupported = errors.Join(e.unsupported, syscallError)
+			}
+		case syscallExit:
+			t.needsUserBoundary = true
+			if pending.restart {
+				stop.Reason, stop.StepCompleted = target.StopUnknown, false
+				if wasInterrupted {
+					stop.Reason = target.StopInterrupt
+				} else {
+					syscallError = fmt.Errorf("syscall restart requires an explicit continue: %w", target.ErrUnsupported)
+				}
+			} else {
+				stop.Reason, stop.StepCompleted = target.StopStep, true
+				e.forgetBreakpointSyscall(t)
+				if e.run != nil && e.run.step != t.ref {
+					internalStep = true
+				}
+			}
+		}
+	}
 	entryComplete := false
 	var entryError error
 	if e.run != nil && e.run.entryThread == t && e.run.entry != nil && stop.Reason == target.StopBreakpoint && t.hit != nil && t.hit.bp == e.run.entry {
@@ -418,6 +548,13 @@ func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 			}
 		}
 	}
+	var retryAction *resumeAction
+	if deferredInterrupt && stop.Reason == target.StopInterrupt && e.barrier == nil && e.run != nil && e.unsupported == nil && e.ownershipError() == nil && !e.life.initializing && e.life.shutdownKind == "" {
+		if action := e.run.actions[t.ref]; action != nil && action.started && action.resumeFailure == nil && action.mode != resumeNone && action.mode != resumeListen {
+			retryAction = action
+			stop.Reason, stop.StepCompleted = target.StopUnknown, false
+		}
+	}
 	t.stopEpoch++
 	e.registersChanged(t)
 	t.stop = copyStop(stop)
@@ -430,6 +567,44 @@ func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 		e.advanceBarrier()
 		return
 	}
+	if e.run != nil {
+		if action := e.run.actions[t.ref]; action != nil && action.resumeFailure != nil {
+			err := action.resumeFailure
+			action.resumeFailure = nil
+			if stop.Reason != target.StopExec {
+				err = &target.PartialError{Op: "resume threads", Completed: e.run.resumeCount, Total: len(e.run.actions), Err: err}
+				e.beginBarrier(t, stop, err)
+				return
+			}
+		}
+	}
+	if retryAction != nil {
+		retryAction.started, retryAction.retry = false, true
+		if err := e.resumeThread(retryAction, false); err != nil {
+			e.resumeFailed(retryAction, err)
+		}
+		return
+	}
+	if syscallError != nil {
+		e.beginBarrier(t, stop, syscallError)
+		return
+	}
+	if syscallEntryComplete {
+		if e.barrier != nil {
+			if e.barrier.thread == nil {
+				e.barrier.thread = t
+			}
+			e.advanceBarrier()
+			return
+		}
+		if e.run != nil {
+			if action := e.run.actions[t.ref]; action != nil {
+				action.started = false
+				e.advanceRun()
+				return
+			}
+		}
+	}
 	if entryError != nil {
 		e.beginBarrier(t, stop, entryError)
 		return
@@ -441,7 +616,7 @@ func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 			return
 		}
 	}
-	if internalStep && stop.StepCompleted && stop.Reason == target.StopStep && len(stop.Watchpoints) == 0 {
+	if internalStep && stop.StepCompleted && stop.Reason == target.StopStep && len(stop.Watchpoints) == 0 && len(stop.HardwareBreakpoints) == 0 {
 		if e.barrier != nil {
 			e.advanceBarrier()
 			return
@@ -459,6 +634,11 @@ func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 	}
 	if e.run != nil && e.barrier == nil && e.unsupported == nil && stop.Reason == target.StopClone {
 		action := e.run.actions[t.ref]
+		if action != nil && t.syscall != nil && t.syscall.phase == syscallExecuting {
+			action.started = false
+			e.advanceRun()
+			return
+		}
 		if action != nil && (action.step || e.run.overThread == t) {
 			action.started, action.cloneStep = false, true
 			if e.run.overThread == t {
@@ -478,7 +658,7 @@ func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 		if !completed && (stop.Reason == target.StopClone || stop.Reason == target.StopFork || stop.Reason == target.StopVFork) {
 			err = errors.Join(err, fmt.Errorf("task creation during breakpoint step: %w", target.ErrUnsupported))
 		}
-		if completed && stop.Reason == target.StopStep && len(stop.Watchpoints) == 0 && err == nil && e.barrier == nil && e.run.step != t.ref {
+		if completed && stop.Reason == target.StopStep && len(stop.Watchpoints) == 0 && len(stop.HardwareBreakpoints) == 0 && err == nil && e.barrier == nil && e.run.step != t.ref {
 			if action := e.run.actions[t.ref]; action != nil {
 				action.started = false
 			}
@@ -525,11 +705,18 @@ func (e *engine) onThreadStop(t *thread, stop target.Stop) {
 }
 
 func (e *engine) onThreadExit(t *thread, stop target.Stop) {
+	e.forgetBreakpointSyscall(t)
+	if e.run != nil {
+		if action := e.run.actions[t.ref]; action != nil {
+			action.resumeFailure = nil
+		}
+	}
 	t.state, t.listening = target.StateExited, false
 	t.exiting, t.exitComplete = false, true
 	t.groupStopped, t.internalStepTrap = false, false
 	t.hit = nil
 	t.pendingSignal, t.interruptRequested = 0, false
+	t.interruptDeferred, t.interruptResumed = false, false
 	t.stopEpoch++
 	e.registersChanged(t)
 	t.stop = copyStop(stop)
@@ -663,7 +850,10 @@ func (e *engine) interruptThread(t *thread) error {
 	if e.life.missing[t.tid] != nil {
 		return nil
 	}
-	if !t.live() || t.exiting || t.state == target.StateStopped || t.state == target.StateUnknown {
+	if !t.live() || t.exiting || t.state == target.StateStopped {
+		return nil
+	}
+	if t.state == target.StateUnknown && !e.resumeWaitPending(t) {
 		return nil
 	}
 	if t.interruptRequested {
@@ -673,10 +863,23 @@ func (e *engine) interruptThread(t *thread) error {
 		return fmt.Errorf("thread was not seized: %w", target.ErrUnsupported)
 	}
 	if err := unix.PtraceInterrupt(t.tid); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			e.awaitOwnedWait(t)
+			return nil
+		}
 		return err
 	}
 	t.interruptRequested = true
+	t.interruptDeferred, t.interruptResumed = false, false
 	return nil
+}
+
+func (e *engine) resumeWaitPending(t *thread) bool {
+	if e.run == nil {
+		return false
+	}
+	action := e.run.actions[t.ref]
+	return action != nil && action.resumeFailure != nil
 }
 
 func (e *engine) interruptAll() error {
@@ -699,7 +902,7 @@ func (e *engine) interrupt(set target.ThreadSet) error {
 	}
 	active := false
 	for _, t := range threads {
-		if t.live() && !t.exiting && t.state == target.StateRunning {
+		if t.live() && !t.exiting && (t.state == target.StateRunning || t.state == target.StateUnknown && e.resumeWaitPending(t)) {
 			active = true
 			if err := e.interruptThread(t); err != nil {
 				return err

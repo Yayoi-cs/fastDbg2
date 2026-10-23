@@ -123,3 +123,30 @@ func TestWatchpointRunWaitersOwnReturnedBuffers(t *testing.T) {
 		}
 	}
 }
+
+func TestHardwareBreakpointRunWaitersOwnReturnedBuffers(t *testing.T) {
+	pc := target.Address(0x401000)
+	run := newRun(10)
+	run.complete(target.RunResult{Stop: target.Stop{
+		Reason: target.StopHardwareBreakpoint, RawPC: &pc,
+		HardwareBreakpoints: []target.HardwareBreakpointHit{{Address: pc}},
+	}}, nil)
+	const count = 16
+	results := make(chan bool, count)
+	for range count {
+		go func() {
+			value, err := run.Wait(context.Background())
+			valid := err == nil && value.Stop.RawPC != nil && *value.Stop.RawPC == 0x401000 && len(value.Stop.HardwareBreakpoints) == 1 && value.Stop.HardwareBreakpoints[0].Address == 0x401000
+			if valid {
+				*value.Stop.RawPC = 0
+				value.Stop.HardwareBreakpoints[0].Address = 0
+			}
+			results <- valid
+		}()
+	}
+	for range count {
+		if !<-results {
+			t.Fatal("a waiter observed another consumer's hardware breakpoint mutation")
+		}
+	}
+}

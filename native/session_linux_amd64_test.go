@@ -46,6 +46,18 @@ func TestClosedSessionRejectsCommandsAndKeepsCloseIdempotent(t *testing.T) {
 	if _, err := session.ClearWatchpoint(target.ThreadToken{}, target.WatchpointRef{}); !errors.Is(err, target.ErrClosed) {
 		t.Fatalf("clear watchpoint: %v", err)
 	}
+	if _, err := session.SetHardwareBreakpoint(target.ThreadToken{}, target.HardwareBreakpointRequest{}); !errors.Is(err, target.ErrClosed) {
+		t.Fatalf("set hardware breakpoint: %v", err)
+	}
+	if _, err := session.ClearHardwareBreakpoint(target.ThreadToken{}, target.HardwareBreakpointRef{}); !errors.Is(err, target.ErrClosed) {
+		t.Fatalf("clear hardware breakpoint: %v", err)
+	}
+	if _, err := session.ReadExtendedRegisters(target.ThreadToken{}); !errors.Is(err, target.ErrClosed) {
+		t.Fatalf("read extended registers: %v", err)
+	}
+	if _, err := session.WriteExtendedRegisters(target.ThreadToken{}, target.ExtendedRegisterState{}); !errors.Is(err, target.ErrClosed) {
+		t.Fatalf("write extended registers: %v", err)
+	}
 }
 
 func TestPartialInitializationReturnsRecoverableSessionBeforeCleanup(t *testing.T) {
@@ -100,6 +112,41 @@ func TestWatchpointStopCopiesAcrossPublicBoundaries(t *testing.T) {
 			{Ref: target.WatchpointRef{Thread: ref, Slot: 1, Generation: 2}, Address: 0x1000, Size: 4, Access: target.WatchWrite},
 		},
 	}
+	check := func(value target.Stop) {
+		t.Helper()
+		if !value.StepCompleted || value.RawDR6 == nil || *value.RawDR6 != 1<<14|3 || len(value.Watchpoints) != 2 || value.Watchpoints[0].Address != 0x1000 || value.Watchpoints[1].Ref.Generation != 2 {
+			t.Fatalf("shared or incomplete watchpoint stop: %+v", value)
+		}
+		value.Watchpoints[0].Address = 0
+		value.Watchpoints[1].Ref.Generation = 0
+		*value.RawDR6 = 0
+	}
+	testPublicStopCopies(t, ref, stop, check)
+}
+
+func TestHardwareBreakpointStopCopiesAcrossPublicBoundaries(t *testing.T) {
+	dr6, pc := uint64(1), target.Address(0x401000)
+	ref := target.ThreadRef{Session: 8, ID: 9}
+	stop := target.Stop{
+		Reason: target.StopHardwareBreakpoint, RawDR6: &dr6, RawPC: &pc,
+		HardwareBreakpoints: []target.HardwareBreakpointHit{{
+			Ref: target.HardwareBreakpointRef{Thread: ref, Slot: 0, Generation: 7}, Address: pc,
+		}},
+	}
+	check := func(value target.Stop) {
+		t.Helper()
+		if value.Reason != target.StopHardwareBreakpoint || value.StepCompleted || value.RawPC == nil || *value.RawPC != 0x401000 || value.RawDR6 == nil || *value.RawDR6 != 1 || len(value.HardwareBreakpoints) != 1 || value.HardwareBreakpoints[0].Address != 0x401000 || value.HardwareBreakpoints[0].Ref.Generation != 7 {
+			t.Fatalf("shared or incomplete hardware breakpoint stop: %+v", value)
+		}
+		value.HardwareBreakpoints[0].Address = 0
+		value.HardwareBreakpoints[0].Ref.Generation = 0
+		*value.RawPC, *value.RawDR6 = 0, 0
+	}
+	testPublicStopCopies(t, ref, stop, check)
+}
+
+func testPublicStopCopies(t *testing.T, ref target.ThreadRef, stop target.Stop, check func(target.Stop)) {
+	t.Helper()
 	session := &Session{id: ref.Session, requests: make(chan func(*engine)), done: make(chan struct{})}
 	p := &process{ref: target.ProcessRef{Session: ref.Session, ID: 1}}
 	e := &engine{
@@ -111,7 +158,7 @@ func TestWatchpointStopCopiesAcrossPublicBoundaries(t *testing.T) {
 	e.sequence = session.publishEvent(target.Event{Kind: target.EventAllStopped, Thread: ref, Stop: stop})
 	run := newRun(1)
 	run.complete(target.RunResult{Thread: ref, Stop: stop}, nil)
-	stop.Watchpoints[0].Address, dr6 = 0, 0
+	check(stop)
 	quit := make(chan struct{})
 	go func() {
 		defer close(session.done)
@@ -125,15 +172,6 @@ func TestWatchpointStopCopiesAcrossPublicBoundaries(t *testing.T) {
 		}
 	}()
 	t.Cleanup(func() { close(quit); <-session.done })
-	check := func(value target.Stop) {
-		t.Helper()
-		if !value.StepCompleted || value.RawDR6 == nil || *value.RawDR6 != 1<<14|3 || len(value.Watchpoints) != 2 || value.Watchpoints[0].Address != 0x1000 || value.Watchpoints[1].Ref.Generation != 2 {
-			t.Fatalf("shared or incomplete watchpoint stop: %+v", value)
-		}
-		value.Watchpoints[0].Address = 0
-		value.Watchpoints[1].Ref.Generation = 0
-		*value.RawDR6 = 0
-	}
 	for range 2 {
 		result, err := run.Wait(context.Background())
 		if err != nil {

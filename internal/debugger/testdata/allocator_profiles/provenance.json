@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "profile": "cachyos-glibc-244.json",
+  "profile_sha256": "4f60b5efd138c2395d94e6eff1b99a84793e3738b7b4c4ac3763dcb7e551ecca",
+  "package": "CachyOS glibc 2.44+r50+g1848099f063e-3 x86_64_v3",
+  "gnu_source_revision": "1848099f063e",
+  "libc_build_id": "e363db7c8fcc7c06c6f0d2839b2a8ad875b75406",
+  "loader_build_id": "3cad94f849ea29f8e91c1006184fe034fbc58c29",
+  "debug_sources": [
+    "https://debuginfod.cachyos.org/buildid/e363db7c8fcc7c06c6f0d2839b2a8ad875b75406/debuginfo",
+    "https://debuginfod.cachyos.org/buildid/3cad94f849ea29f8e91c1006184fe034fbc58c29/debuginfo"
+  ],
+  "source_urls": [
+    "https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=malloc/malloc.c;hb=1848099f063e",
+    "https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=malloc/arena.c;hb=1848099f063e",
+    "https://ftp.gnu.org/gnu/glibc/glibc-2.44.tar.xz"
+  ],
+  "generation": "FASTDBG_LIBC_DEBUG=<exact libc debug ELF> FASTDBG_LOADER_DEBUG=<exact loader debug ELF> FASTDBG_MALLOC_SOURCE=<matching malloc.c> FASTDBG_ARENA_SOURCE=<matching arena.c> FASTDBG_PROFILE_NAME=glibc-cachyos-2.44-r50-x86_64_v3 FASTDBG_SOURCE_REVISION=1848099f063e FASTDBG_PROFILE_OUTPUT=<output.json> gdb --nx --nh --batch -x generate.py",
+  "derivation": [
+    "ELF64 full build IDs and exact unique local/TLS symbol values from matching debug ELF",
+    "GDB DWARF declared allocator/TCB/pthread/DTV members from exact libc; link_map/slotinfo/rtld_global members from exact loader; anonymous-union inactive/disabled positions from libc",
+    "malloc alignment from target size_t and long double alignment; MINSIZE from fd_nextsize offset",
+    "tcache bin counts from exact source macro declarations",
+    "HEAP_MAX_SIZE from reviewed AMD64 source branch 2*4MiB*sizeof(long)",
+    "TLS generation/slotinfo/static fallback follows matching glibc td_thr_tlsbase public source, no inferior calls"
+  ],
+  "runtime": "No GDB execution, source lookup, debuginfod request or external profile file is needed for this builtin full-ID pair. Unknown paired builds are rejected, not treated as host glibc.",
+  "source_semantics_sha256": "a3c2cbe4e16033e34c939d9c64251a5351901fc7f2afde5c6dd974e6765e9b13",
+  "generator_sha256": "8b78bbd3b571a04e744babc1e3449832581d848cf388f0637cf1bdc128a755ce"
+}

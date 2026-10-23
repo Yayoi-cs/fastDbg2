@@ -64,6 +64,29 @@ func (s *Session) worker(start func(*engine) error, ready chan response[*Session
 	}
 }
 
+func (e *engine) canRetryLaunchInterrupt(t *thread, w waitResult) bool {
+	return e.life.launch != nil && e.life.initializing && e.life.launchReleased && !e.life.launchExec &&
+		e.life.shutdownKind == "" && e.barrier == nil && e.run == nil && e.unsupported == nil && e.ownershipError() == nil &&
+		t != nil && t.process != nil && t.process == e.primary && t.process.owned && t.tid == t.process.tgid &&
+		t.seized && !t.exiting && !t.listening && t.state == target.StateStopped &&
+		t.interruptDeferred && t.interruptResumed && !t.interruptRequested &&
+		w.err == nil && w.pid == t.tid && w.status.Stopped() && w.status.StopSignal() == unix.SIGTRAP &&
+		uint32(w.status)>>16 == unix.PTRACE_EVENT_STOP
+}
+
+func (e *engine) retryLaunchInterrupt(t *thread, w waitResult) bool {
+	if !e.canRetryLaunchInterrupt(t, w) {
+		return false
+	}
+	t.interruptDeferred, t.interruptResumed = false, false
+	if err := unix.PtraceCont(t.tid, 0); err != nil {
+		e.failInitialization(err)
+		return true
+	}
+	t.state = target.StateRunning
+	return true
+}
+
 func profileForELF(f *os.File) (*arch.Descriptor, error) {
 	b, err := elf.NewFile(f)
 	if err != nil {
@@ -170,13 +193,16 @@ func (e *engine) classifySignal(t *thread, w waitResult, stepping bool) (target.
 }
 
 func (e *engine) classify(t *thread, w waitResult, stepping bool) (target.Stop, error) {
+	if stop, handled, err := e.classifyBreakpointSyscall(t, w); handled || err != nil {
+		return stop, err
+	}
 	stop, info, err := e.classifySignal(t, w, stepping)
 	if err != nil || stop.Reason == target.StopExec {
 		return stop, err
 	}
 	if info != nil && w.status.StopSignal() == unix.SIGTRAP && (info.Code == 2 || info.Code == 4) {
 		stop.StepCompleted = false
-		hits, stepBit, dr6, err := e.watchpointStop(t, info.Code)
+		hits, execution, stepBit, dr6, err := e.watchpointStop(t, info.Code)
 		stop.RawDR6 = dr6
 		if dr6 != nil {
 			stop.Raw += fmt.Sprintf(" dr6=0x%x", *dr6)
@@ -189,14 +215,24 @@ func (e *engine) classify(t *thread, w waitResult, stepping bool) (target.Stop, 
 			}
 			return stop, err
 		}
+		stop.HardwareBreakpoints = execution
 		stop, t.pendingSignal = applyWatchpointStop(stop, info.Code, hits, stepBit, *dr6, stepping)
-		if len(hits) != 0 {
-			t.needsUserBoundary = false
-		}
 	}
 	stop, err = e.capturePC(stop)
 	if err != nil {
+		if len(stop.HardwareBreakpoints) != 0 {
+			stop.Reason, stop.StepCompleted = target.StopUnknown, false
+			t.pendingSignal = int(unix.SIGTRAP)
+		}
 		return stop, err
+	}
+	if err := validateHardwareBreakpointPC(stop); err != nil {
+		stop.Reason, stop.StepCompleted = target.StopUnknown, false
+		t.pendingSignal = int(unix.SIGTRAP)
+		return stop, err
+	}
+	if len(stop.Watchpoints) != 0 || len(stop.HardwareBreakpoints) != 0 {
+		t.needsUserBoundary = false
 	}
 	if info != nil && info.Code == 1 && w.status.StopSignal() == unix.SIGTRAP {
 		if expected, ok := e.life.syscallSteps[t]; ok && expected.space == t.process.space.ref && *stop.RawPC == expected.pc && target.Address(binary.LittleEndian.Uint64(info.Data[:8])) == expected.pc {
@@ -239,6 +275,7 @@ type syscallStep struct {
 func (e *engine) forgetSyscallStep(t *thread) {
 	delete(e.life.syscallSteps, t)
 	delete(e.life.cloneChildren, t)
+	e.forgetBreakpointSyscall(t)
 }
 
 func (e *engine) prepareSyscallStep(t *thread, action *resumeAction, step bool) (func(), error) {
@@ -366,8 +403,13 @@ func (e *engine) validateCloneStep(t *thread) error {
 
 func applyWatchpointStop(stop target.Stop, code int32, hits []target.WatchpointHit, stepBit bool, dr6 uint64, stepping bool) (target.Stop, int) {
 	stop.StepCompleted = code == 2 && stepping && stepBit
+	stop.Watchpoints = hits
+	if len(stop.HardwareBreakpoints) != 0 {
+		stop.Reason, stop.StepCompleted = target.StopHardwareBreakpoint, false
+		return stop, 0
+	}
 	if len(hits) != 0 {
-		stop.Reason, stop.Watchpoints = target.StopWatchpoint, hits
+		stop.Reason = target.StopWatchpoint
 		if stepBit && !stepping {
 			return stop, int(unix.SIGTRAP)
 		}
@@ -379,4 +421,13 @@ func applyWatchpointStop(stop target.Stop, code int32, hits []target.WatchpointH
 	}
 	stop.Reason = target.StopSignal
 	return stop, int(unix.SIGTRAP)
+}
+
+func validateHardwareBreakpointPC(stop target.Stop) error {
+	for _, hit := range stop.HardwareBreakpoints {
+		if stop.RawPC == nil || *stop.RawPC != hit.Address {
+			return fmt.Errorf("hardware execution breakpoint slot %d disagrees with the stopped PC: %w", hit.Ref.Slot, target.ErrUnknown)
+		}
+	}
+	return nil
 }

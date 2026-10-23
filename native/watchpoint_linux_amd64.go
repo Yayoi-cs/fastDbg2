@@ -26,6 +26,7 @@ type debugImage struct {
 type physicalWatchpoint struct {
 	ref     target.WatchpointRef
 	request target.WatchpointRequest
+	execute bool
 }
 
 type debugTransaction struct {
@@ -178,6 +179,19 @@ func watchpointEncoding(profile *arch.Descriptor, request target.WatchpointReque
 	}
 }
 
+func hardwareBreakpointEncoding(profile *arch.Descriptor, request target.HardwareBreakpointRequest) (uint64, error) {
+	if request.Slot < 0 || request.Slot >= 4 {
+		return 0, target.ErrInvalidArgument
+	}
+	if profile == nil || (profile.Architecture != target.AMD64 && profile.Architecture != target.X86) {
+		return 0, target.ErrUnsupported
+	}
+	if err := profile.ValidateRange(request.Address, 1); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
 func watchpointImage(state *watchpointState, before debugImage, request target.WatchpointRequest, encoding uint64) (debugImage, error) {
 	if enabledDebugSlots(before.control)&^state.ownedSlots() != 0 {
 		return debugImage{}, fmt.Errorf("hardware debug register bank has foreign enabled slots: %w", target.ErrBusy)
@@ -266,6 +280,18 @@ func (e *engine) initializeWatchpoints(t *thread) error {
 }
 
 func (e *engine) setWatchpoint(token target.ThreadToken, request target.WatchpointRequest) (target.WatchpointResult, error) {
+	return e.setPhysicalBreakpoint(token, request, false)
+}
+
+func (e *engine) setHardwareBreakpoint(token target.ThreadToken, request target.HardwareBreakpointRequest) (target.HardwareBreakpointResult, error) {
+	result, err := e.setPhysicalBreakpoint(token, target.WatchpointRequest{Slot: request.Slot, Address: request.Address, Size: 1}, true)
+	if err != nil {
+		return target.HardwareBreakpointResult{}, err
+	}
+	return target.HardwareBreakpointResult{Ref: target.HardwareBreakpointRef(result.Ref), Token: result.Token}, nil
+}
+
+func (e *engine) setPhysicalBreakpoint(token target.ThreadToken, request target.WatchpointRequest, execute bool) (target.WatchpointResult, error) {
 	var result target.WatchpointResult
 	if err := e.requireAllStopped(); err != nil {
 		return result, err
@@ -274,7 +300,12 @@ func (e *engine) setWatchpoint(token target.ThreadToken, request target.Watchpoi
 	if err != nil {
 		return result, err
 	}
-	encoding, err := watchpointEncoding(t.process.profile, request)
+	var encoding uint64
+	if execute {
+		encoding, err = hardwareBreakpointEncoding(t.process.profile, target.HardwareBreakpointRequest{Slot: request.Slot, Address: request.Address})
+	} else {
+		encoding, err = watchpointEncoding(t.process.profile, request)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -284,6 +315,9 @@ func (e *engine) setWatchpoint(token target.ThreadToken, request target.Watchpoi
 	state := t.watchpoints
 	if state.space != t.process.space.ref {
 		return result, target.ErrStale
+	}
+	if point := state.slots[request.Slot]; point != nil && point.execute != execute {
+		return result, fmt.Errorf("hardware slot %d has a different breakpoint kind: %w", request.Slot, target.ErrBusy)
 	}
 	before, err := readDebugImage(t)
 	if err != nil {
@@ -307,11 +341,19 @@ func (e *engine) setWatchpoint(token target.ThreadToken, request target.Watchpoi
 		return result, err
 	}
 	ref := target.WatchpointRef{Thread: t.ref, Slot: request.Slot, Generation: state.nextGeneration}
-	state.slots[request.Slot] = &physicalWatchpoint{ref: ref, request: request}
+	state.slots[request.Slot] = &physicalWatchpoint{ref: ref, request: request, execute: execute}
 	return target.WatchpointResult{Ref: ref, Token: t.token()}, nil
 }
 
 func (e *engine) clearWatchpoint(token target.ThreadToken, ref target.WatchpointRef) (target.ThreadToken, error) {
+	return e.clearPhysicalBreakpoint(token, ref, false)
+}
+
+func (e *engine) clearHardwareBreakpoint(token target.ThreadToken, ref target.HardwareBreakpointRef) (target.ThreadToken, error) {
+	return e.clearPhysicalBreakpoint(token, target.WatchpointRef(ref), true)
+}
+
+func (e *engine) clearPhysicalBreakpoint(token target.ThreadToken, ref target.WatchpointRef, execute bool) (target.ThreadToken, error) {
 	if ref.Thread != token.Thread || ref.Slot < 0 || ref.Slot >= 4 || ref.Generation == 0 {
 		return target.ThreadToken{}, target.ErrInvalidArgument
 	}
@@ -323,7 +365,7 @@ func (e *engine) clearWatchpoint(token target.ThreadToken, ref target.Watchpoint
 		return target.ThreadToken{}, err
 	}
 	state := t.watchpoints
-	if state == nil || state.space != t.process.space.ref || state.slots[ref.Slot] == nil || state.slots[ref.Slot].ref != ref {
+	if state == nil || state.space != t.process.space.ref || state.slots[ref.Slot] == nil || state.slots[ref.Slot].ref != ref || state.slots[ref.Slot].execute != execute {
 		return target.ThreadToken{}, target.ErrStale
 	}
 	before, err := readDebugImage(t)
@@ -348,25 +390,25 @@ func (e *engine) clearWatchpoint(token target.ThreadToken, ref target.Watchpoint
 	return t.token(), nil
 }
 
-func (e *engine) watchpointStop(t *thread, code int32) ([]target.WatchpointHit, bool, *uint64, error) {
+func (e *engine) watchpointStop(t *thread, code int32) ([]target.WatchpointHit, []target.HardwareBreakpointHit, bool, *uint64, error) {
 	if code != 2 && code != 4 {
-		return nil, false, nil, target.ErrInvalidArgument
+		return nil, nil, false, nil, target.ErrInvalidArgument
 	}
 	image, err := readDebugImage(t)
 	if err != nil {
-		return nil, false, nil, err
+		return nil, nil, false, nil, err
 	}
 	state := t.watchpoints
 	if state != nil && (t.process == nil || t.process.space == nil || state.space != t.process.space.ref) {
-		return nil, false, &image.status, target.ErrStale
+		return nil, nil, false, &image.status, target.ErrStale
 	}
 	if state != nil && state.ownedSlots() != 0 {
 		if err := validateWatchpointCause(code, image.status); err != nil {
-			return nil, image.status&debugStep != 0, &image.status, err
+			return nil, nil, image.status&debugStep != 0, &image.status, err
 		}
 	}
-	hits, step, _, err := decodeWatchpointStop(state, image)
-	return hits, step, &image.status, err
+	hits, execution, step, _, err := decodeWatchpointStop(state, image)
+	return hits, execution, step, &image.status, err
 }
 
 func validateWatchpointCause(code int32, status uint64) error {
@@ -376,29 +418,37 @@ func validateWatchpointCause(code int32, status uint64) error {
 	return nil
 }
 
-func decodeWatchpointStop(state *watchpointState, image debugImage) ([]target.WatchpointHit, bool, uint64, error) {
+func decodeWatchpointStop(state *watchpointState, image debugImage) ([]target.WatchpointHit, []target.HardwareBreakpointHit, bool, uint64, error) {
 	step := image.status&debugStep != 0
 	if state == nil || state.ownedSlots() == 0 {
-		return nil, step, image.status, nil
+		return nil, nil, step, image.status, nil
 	}
 	if err := state.checkImage(image); err != nil {
-		return nil, step, image.status, err
+		return nil, nil, step, image.status, err
 	}
 	bits := uint8(image.status & 15)
 	if bits&^state.ownedSlots() != 0 {
-		return nil, step, image.status, fmt.Errorf("hardware trap includes unowned slots: %w", target.ErrUnsupported)
+		return nil, nil, step, image.status, fmt.Errorf("hardware trap includes unowned slots: %w", target.ErrUnsupported)
 	}
 	var hits []target.WatchpointHit
+	var execution []target.HardwareBreakpointHit
 	for slot, watch := range state.slots {
 		if bits&(1<<slot) != 0 {
 			if watch == nil || enabledDebugSlots(image.control)&(1<<slot) == 0 {
-				return nil, step, image.status, target.ErrStale
+				return nil, nil, step, image.status, target.ErrStale
 			}
-			hits = append(hits, target.WatchpointHit{Ref: watch.ref, Address: watch.request.Address, Size: watch.request.Size, Access: watch.request.Access})
+			if watch.execute {
+				if step {
+					return nil, nil, step, image.status, fmt.Errorf("hardware execution breakpoint and single-step causes conflict: %w", target.ErrUnknown)
+				}
+				execution = append(execution, target.HardwareBreakpointHit{Ref: target.HardwareBreakpointRef(watch.ref), Address: watch.request.Address})
+			} else {
+				hits = append(hits, target.WatchpointHit{Ref: watch.ref, Address: watch.request.Address, Size: watch.request.Size, Access: watch.request.Access})
+			}
 		}
 	}
 	state.current.status = image.status
-	return hits, step, image.status, nil
+	return hits, execution, step, image.status, nil
 }
 
 func (e *engine) prepareWatchpointResume(t *thread) error {

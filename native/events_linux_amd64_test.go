@@ -143,12 +143,23 @@ func TestNativeCapabilitiesOnlyAdvertiseImplementedExecution(t *testing.T) {
 	if capabilities.WatchpointSlotsPerThread != 4 || !slices.Equal(capabilities.WatchpointSizes, []int{1, 2, 4, 8}) {
 		t.Fatalf("watchpoint geometry=%+v", capabilities)
 	}
+	if !capabilities.HardwareBreakpoints || capabilities.HardwareSlotsPerThread != 4 || capabilities.HardwareSlotsPerThread != capabilities.WatchpointSlotsPerThread {
+		t.Fatalf("hardware execution and data breakpoints must share four slots: %+v", capabilities)
+	}
+	formats := []target.ExtendedRegisterFormat{target.ExtendedFormatXSave, target.ExtendedFormatFXSave}
+	if !capabilities.ExtendedRegisters || !slices.Equal(capabilities.ExtendedRegisterFormats, formats) {
+		t.Fatalf("extended register formats=%+v", capabilities)
+	}
 	capabilities.Modes[0] = target.NonStop
 	capabilities.WatchpointSizes[0] = 16
+	capabilities.ExtendedRegisterFormats[0] = target.ExtendedFormatUnknown
 	if session.Capabilities().Modes[0] != target.AllStop {
 		t.Fatal("capabilities retained caller-owned mode slice")
 	}
 	if !slices.Equal(session.Capabilities().WatchpointSizes, []int{1, 2, 4, 8}) {
 		t.Fatal("capabilities retained caller-owned watchpoint geometry")
+	}
+	if !slices.Equal(session.Capabilities().ExtendedRegisterFormats, formats) {
+		t.Fatal("capabilities retained caller-owned extended register formats")
 	}
 }

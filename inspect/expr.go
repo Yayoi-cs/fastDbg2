@@ -54,6 +54,27 @@ func EvalExpression(expression string, resolver ExpressionResolver) (uint64, err
 	return value, nil
 }
 
+func ParseSymbolExpression(expression string) (string, error) {
+	if len(expression) > maxExpressionBytes {
+		return "", fmt.Errorf("symbol expression exceeds %d bytes: %w", maxExpressionBytes, target.ErrInvalidArgument)
+	}
+	parser := expressionParser{input: expression}
+	if err := parser.next(); err != nil {
+		return "", err
+	}
+	symbol := parser.current
+	if symbol.register || symbol.kind != token.IDENT && symbol.kind != token.STRING {
+		return "", fmt.Errorf("expected one symbol identifier or backtick-quoted symbol: %w", target.ErrUnsupported)
+	}
+	if err := parser.next(); err != nil {
+		return "", err
+	}
+	if parser.current.kind != token.EOF {
+		return "", fmt.Errorf("symbol expression contains additional tokens: %w", target.ErrUnsupported)
+	}
+	return symbol.text, nil
+}
+
 func (p *expressionParser) invalid(format string, args ...any) error {
 	return fmt.Errorf("%w at byte %d: %s", target.ErrInvalidArgument, p.current.position, fmt.Sprintf(format, args...))
 }

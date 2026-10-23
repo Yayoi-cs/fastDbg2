@@ -9,14 +9,15 @@ import (
 )
 
 type Session struct {
-	id           uint64
-	requests     chan func(*engine)
-	done         chan struct{}
-	pid          int
-	architecture target.Architecture
-	state        atomic.Uint32
-	last         atomic.Pointer[target.Stop]
-	events       eventJournal
+	id            uint64
+	requests      chan func(*engine)
+	done          chan struct{}
+	pid           int
+	architecture  target.Architecture
+	state         atomic.Uint32
+	last          atomic.Pointer[target.Stop]
+	events        eventJournal
+	detachedChild *detachedChild
 }
 
 var sessionSequence atomic.Uint64
@@ -112,7 +113,38 @@ func (s *Session) Capabilities() target.Capabilities {
 		HardwareWatchpoints:      true,
 		WatchpointSlotsPerThread: 4,
 		WatchpointSizes:          []int{1, 2, 4, 8},
+		HardwareBreakpoints:      true,
+		HardwareSlotsPerThread:   4,
+		ExtendedRegisters:        true,
+		ExtendedRegisterFormats:  []target.ExtendedRegisterFormat{target.ExtendedFormatXSave, target.ExtendedFormatFXSave},
 	}
+}
+
+func (s *Session) ReadExtendedRegisters(token target.ThreadToken) (target.ExtendedRegisterState, error) {
+	return call(s, func(e *engine) (target.ExtendedRegisterState, error) {
+		state, err := e.readExtendedRegisters(token)
+		return copyExtendedRegisterState(state), err
+	})
+}
+
+func (s *Session) WriteExtendedRegisters(token target.ThreadToken, state target.ExtendedRegisterState) (target.ExtendedRegisterState, error) {
+	state = copyExtendedRegisterState(state)
+	return call(s, func(e *engine) (target.ExtendedRegisterState, error) {
+		actual, err := e.writeExtendedRegisters(token, state)
+		return copyExtendedRegisterState(actual), err
+	})
+}
+
+func (s *Session) SetHardwareBreakpoint(token target.ThreadToken, request target.HardwareBreakpointRequest) (target.HardwareBreakpointResult, error) {
+	return call(s, func(e *engine) (target.HardwareBreakpointResult, error) {
+		return e.setHardwareBreakpoint(token, request)
+	})
+}
+
+func (s *Session) ClearHardwareBreakpoint(token target.ThreadToken, ref target.HardwareBreakpointRef) (target.ThreadToken, error) {
+	return call(s, func(e *engine) (target.ThreadToken, error) {
+		return e.clearHardwareBreakpoint(token, ref)
+	})
 }
 
 func (s *Session) SetWatchpoint(token target.ThreadToken, request target.WatchpointRequest) (target.WatchpointResult, error) {
@@ -188,7 +220,7 @@ func (s *Session) shutdown(kind string) error {
 	case s.requests <- func(e *engine) { e.beginShutdown(kind, r) }:
 	case <-s.done:
 		if kind == "close" {
-			return nil
+			return s.detachedChildError()
 		}
 		return target.ErrClosed
 	}
@@ -204,7 +236,7 @@ func (s *Session) shutdown(kind string) error {
 			return err
 		default:
 			if kind == "close" && s.State() == target.StateClosed {
-				return nil
+				return s.detachedChildError()
 			}
 			return target.ErrClosed
 		}
@@ -213,6 +245,7 @@ func (s *Session) shutdown(kind string) error {
 
 func copyStop(s target.Stop) target.Stop {
 	s.Watchpoints = slices.Clone(s.Watchpoints)
+	s.HardwareBreakpoints = slices.Clone(s.HardwareBreakpoints)
 	if s.RawDR6 != nil {
 		value := *s.RawDR6
 		s.RawDR6 = &value
@@ -234,4 +267,14 @@ func copyStop(s target.Stop) target.Stop {
 		s.Breakpoint = &v
 	}
 	return s
+}
+
+func copyExtendedRegisterState(state target.ExtendedRegisterState) target.ExtendedRegisterState {
+	state.Data = slices.Clone(state.Data)
+	if state.XState != nil {
+		info := *state.XState
+		info.ExtendedComponents = slices.Clone(info.ExtendedComponents)
+		state.XState = &info
+	}
+	return state
 }

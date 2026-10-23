@@ -1238,7 +1238,7 @@ func TestNativeThreadsBlockingBreakpointCanInterruptOrClose(t *testing.T) {
 			f.send(t, 1, 'g')
 			threadBreakpoint(t, threadRun(t, s, threadExact(selected.Ref)), site)
 			f.send(t, 2, 'g')
-			run := threadStart(t, s, target.RunRequest{Threads: threadProcessSet(threadSnapshot(t, s))})
+			run := threadStart(t, s, target.RunRequest{Threads: threadExact(selected.Ref)})
 			threadWaitForRead(t, s.PID(), tids[1])
 			if closeRunning {
 				threadCommand(t, s.Close)
@@ -1257,11 +1257,18 @@ func TestNativeThreadsBlockingBreakpointCanInterruptOrClose(t *testing.T) {
 			}
 			threadStopped(t, s, 3)
 			if got := threadValues(t, s, f, "counters"); got != [3]uint32{} {
-				t.Fatalf("inline step-over unexpectedly ran peers: %v", got)
+				t.Fatalf("exact-thread run unexpectedly ran peers: %v", got)
+			}
+			stopped := threadSnapshot(t, s)
+			var armed [1]byte
+			if n, err := threadCall(t, func() (int, error) { return s.ReadSpaceMemory(stopped.Memory, site, armed[:]) }); err != nil || n != 1 || armed[0] != 0xcc {
+				t.Fatalf("syscall entry did not rearm the shared breakpoint: %x, %d, %v", armed, n, err)
 			}
 			peer := threadByTID(t, threadSnapshot(t, s), tids[2])
-			if run, err := threadCall(t, func() (*native.Run, error) { return s.Run(target.RunRequest{Threads: threadExact(peer.Ref)}) }); err == nil || run != nil {
-				t.Fatalf("peer-only run accepted while original instruction is suspended: %+v, %v", run, err)
+			peerRun := threadStart(t, s, target.RunRequest{Threads: threadExact(peer.Ref)})
+			threadCommand(t, func() error { return s.Interrupt(target.InterruptRequest{Threads: threadExact(peer.Ref)}) })
+			if result := threadWait(t, peerRun); result.Stop.Reason != target.StopInterrupt {
+				t.Fatalf("peer-only run after syscall entry: %+v", result)
 			}
 			threadCommand(t, func() error { return s.RemoveBreakpoint(site) })
 			end := f.address(t, "done_checkpoint")

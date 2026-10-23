@@ -1,0 +1,313 @@
+{
+  "ArenaSourceSHA256": "681fd74b3ddf2011e4dace7e9967c145882dd8889baed8b7ccfcf3404ad9a48e",
+  "Constants": {
+    "Alignment": 16,
+    "ChunkHeaderSize": 16,
+    "FastBinShift": 0,
+    "HeapMaxSize": 67108864,
+    "MinChunkSize": 32,
+    "NormalBinCount": 128,
+    "SizeFlags": 7,
+    "SmallBinCount": 64,
+    "TcacheLargeBinCount": 12,
+    "TcacheSmallBinCount": 64
+  },
+  "DummyDisabledOffset": 8,
+  "DummyInactiveOffset": 0,
+  "HeapInfo": {
+    "fields": {
+      "ar_ptr": {
+        "count": 1,
+        "offset": 0,
+        "stride": 8,
+        "width": 8
+      },
+      "mprotect_size": {
+        "count": 1,
+        "offset": 24,
+        "stride": 8,
+        "width": 8
+      },
+      "pagesize": {
+        "count": 1,
+        "offset": 32,
+        "stride": 8,
+        "width": 8
+      },
+      "prev": {
+        "count": 1,
+        "offset": 8,
+        "stride": 8,
+        "width": 8
+      },
+      "size": {
+        "count": 1,
+        "offset": 16,
+        "stride": 8,
+        "width": 8
+      }
+    },
+    "size": 48
+  },
+  "Layout": {
+    "allocator": "glibc",
+    "arch": "amd64",
+    "arena": {
+      "fields": {
+        "attached_threads": {
+          "count": 1,
+          "offset": 2088,
+          "stride": 8,
+          "width": 8
+        },
+        "binmap": {
+          "count": 4,
+          "offset": 2056,
+          "stride": 4,
+          "width": 4
+        },
+        "bins": {
+          "count": 254,
+          "offset": 24,
+          "stride": 8,
+          "width": 8
+        },
+        "flags": {
+          "count": 1,
+          "offset": 4,
+          "stride": 4,
+          "width": 4
+        },
+        "last_remainder": {
+          "count": 1,
+          "offset": 16,
+          "stride": 8,
+          "width": 8
+        },
+        "max_system_mem": {
+          "count": 1,
+          "offset": 2104,
+          "stride": 8,
+          "width": 8
+        },
+        "mutex": {
+          "count": 1,
+          "offset": 0,
+          "stride": 4,
+          "width": 4
+        },
+        "next": {
+          "count": 1,
+          "offset": 2072,
+          "stride": 8,
+          "width": 8
+        },
+        "next_free": {
+          "count": 1,
+          "offset": 2080,
+          "stride": 8,
+          "width": 8
+        },
+        "system_mem": {
+          "count": 1,
+          "offset": 2096,
+          "stride": 8,
+          "width": 8
+        },
+        "top": {
+          "count": 1,
+          "offset": 8,
+          "stride": 8,
+          "width": 8
+        }
+      },
+      "size": 2112
+    },
+    "chunk": {
+      "fields": {
+        "bk": {
+          "count": 1,
+          "offset": 24,
+          "stride": 8,
+          "width": 8
+        },
+        "bk_nextsize": {
+          "count": 1,
+          "offset": 40,
+          "stride": 8,
+          "width": 8
+        },
+        "fd": {
+          "count": 1,
+          "offset": 16,
+          "stride": 8,
+          "width": 8
+        },
+        "fd_nextsize": {
+          "count": 1,
+          "offset": 32,
+          "stride": 8,
+          "width": 8
+        },
+        "mchunk_prev_size": {
+          "count": 1,
+          "offset": 0,
+          "stride": 8,
+          "width": 8
+        },
+        "mchunk_size": {
+          "count": 1,
+          "offset": 8,
+          "stride": 8,
+          "width": 8
+        }
+      },
+      "size": 48
+    },
+    "endian": "little",
+    "fast_link": "",
+    "pointer": 8,
+    "schema": 1,
+    "tcache": {
+      "fields": {
+        "entries": {
+          "count": 76,
+          "offset": 152,
+          "stride": 8,
+          "width": 8
+        },
+        "num_slots": {
+          "count": 76,
+          "offset": 0,
+          "stride": 2,
+          "width": 2
+        }
+      },
+      "size": 760
+    },
+    "tcache_entry": {
+      "fields": {
+        "key": {
+          "count": 1,
+          "offset": 8,
+          "stride": 8,
+          "width": 8
+        },
+        "next": {
+          "count": 1,
+          "offset": 0,
+          "stride": 8,
+          "width": 8
+        }
+      },
+      "size": 16
+    },
+    "tcache_link": "safe-link-12"
+  },
+  "LibcBuildID": "e363db7c8fcc7c06c6f0d2839b2a8ad875b75406",
+  "LibcDebugSHA256": "7141d32de0529a8a9d57b102e9ee30c460130d14a48f7b40179d50aa6d5d49cb",
+  "LoaderBuildID": "3cad94f849ea29f8e91c1006184fe034fbc58c29",
+  "LoaderDebugSHA256": "9beef2b70ee2ea63b5e0f1ccb297dabe1a8fefff6815a901b9ecf79cb7a367d3",
+  "MallocPar": {
+    "fields": {
+      "hp_pagesize": {
+        "count": 1,
+        "offset": 56,
+        "stride": 8,
+        "width": 8
+      },
+      "sbrk_base": {
+        "count": 1,
+        "offset": 104,
+        "stride": 8,
+        "width": 8
+      },
+      "tcache_count": {
+        "count": 1,
+        "offset": 128,
+        "stride": 8,
+        "width": 8
+      },
+      "tcache_max_bytes": {
+        "count": 1,
+        "offset": 120,
+        "stride": 8,
+        "width": 8
+      },
+      "tcache_small_bins": {
+        "count": 1,
+        "offset": 112,
+        "stride": 8,
+        "width": 8
+      }
+    },
+    "size": 136
+  },
+  "MallocSourceSHA256": "654dac271e46a53620451d408ae045d49c1c78487f5e96fddb3546e9ee5a4572",
+  "Name": "glibc-cachyos-2.44-r50-x86_64_v3",
+  "Schema": 1,
+  "Semantics": {
+    "HeapMaxMode": "constant",
+    "TcacheCounterMode": "num_slots",
+    "TcacheMaxBytesMode": "chunk-exclusive",
+    "TcacheSmallBinsField": "tcache_small_bins",
+    "TcacheStateMode": "dummy"
+  },
+  "SourceRevision": "1848099f063e",
+  "Symbols": {
+    "__tcache_dummy": {
+      "Size": 768,
+      "Type": 1,
+      "Value": 2002528
+    },
+    "_rtld_global": {
+      "Size": 2136,
+      "Type": 1,
+      "Value": 282624
+    },
+    "main_arena": {
+      "Size": 2112,
+      "Type": 1,
+      "Value": 2427584
+    },
+    "mp_": {
+      "Size": 136,
+      "Type": 1,
+      "Value": 2425216
+    },
+    "tcache": {
+      "Size": 8,
+      "Type": 6,
+      "Value": 32
+    },
+    "thread_arena": {
+      "Size": 8,
+      "Type": 6,
+      "Value": 80
+    }
+  },
+  "TLS": {
+    "DTVEntrySize": 16,
+    "DTVGenerationOffset": 0,
+    "DTVPointerOffset": 0,
+    "LinkMapBlockSizeOffset": 1136,
+    "LinkMapModIDOffset": 1168,
+    "LinkMapSize": 1208,
+    "LinkMapStaticOffset": 1160,
+    "RTLDGenerationOffset": 2032,
+    "RTLDSlotInfoOffset": 1992,
+    "SlotEntrySize": 16,
+    "SlotGenerationOffset": 0,
+    "SlotListEntriesOffset": 16,
+    "SlotListLengthOffset": 0,
+    "SlotListNextOffset": 8,
+    "SlotListSize": 16,
+    "SlotMapOffset": 8,
+    "TCBSize": 704,
+    "ThreadDTVOffset": 8,
+    "ThreadSelfOffset": 16,
+    "ThreadSize": 2368,
+    "ThreadTCBOffset": 0,
+    "ThreadTIDOffset": 720
+  }
+}

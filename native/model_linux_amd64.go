@@ -46,6 +46,8 @@ type thread struct {
 	registerRevision   uint64
 	pendingSignal      int
 	interruptRequested bool
+	interruptDeferred  bool
+	interruptResumed   bool
 	internalStepTrap   bool
 	needsUserBoundary  bool
 	seized             bool
@@ -55,7 +57,9 @@ type thread struct {
 	listening          bool
 	hit                *breakpointHit
 	suspended          *breakpoint
+	syscall            *breakpointSyscall
 	watchpoints        *watchpointState
+	extendedFault      error
 	fault              error
 }
 
@@ -70,13 +74,26 @@ type addressSpace struct {
 }
 
 type resumeAction struct {
-	thread    *thread
-	step      bool
-	signal    int
-	started   bool
-	resumed   bool
-	cloneStep bool
+	thread        *thread
+	step          bool
+	signal        int
+	started       bool
+	resumed       bool
+	cloneStep     bool
+	mode          resumeMode
+	retry         bool
+	resumeFailure error
 }
+
+type resumeMode uint8
+
+const (
+	resumeNone resumeMode = iota
+	resumeContinue
+	resumeStep
+	resumeSyscall
+	resumeListen
+)
 
 type runOperation struct {
 	handle      *Run

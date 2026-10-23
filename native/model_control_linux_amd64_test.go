@@ -273,13 +273,14 @@ func TestControlLegacyRejectsAmbiguousThread(t *testing.T) {
 func TestControlSteppingClassificationIsThreadLocal(t *testing.T) {
 	e, threads := controlModel(2)
 	e.run = &runOperation{handle: newRun(1), actions: map[target.ThreadRef]*resumeAction{
-		threads[0].ref: {thread: threads[0], step: true, started: true},
+		threads[0].ref: {thread: threads[0], step: true, started: true, mode: resumeStep},
 		threads[1].ref: {thread: threads[1], started: true},
 	}}
 	if !e.threadStepping(threads[0]) || e.threadStepping(threads[1]) {
 		t.Fatal("step expectation leaked between threads")
 	}
 	e.run.overThread = threads[1]
+	e.run.actions[threads[1].ref].mode = resumeStep
 	if !e.threadStepping(threads[1]) {
 		t.Fatal("hidden step was not recognized")
 	}
@@ -472,6 +473,31 @@ func TestModelWatchpointFaultDoesNotInvalidateMemory(t *testing.T) {
 	}
 }
 
+func TestControlExtendedRegisterFaultPreventsPartialResume(t *testing.T) {
+	e, threads := controlModel(2)
+	fault := errors.New("extended register write was not confirmed")
+	threads[1].extendedFault = fault
+	memory := e.snapshot().Memory
+	_, err := e.startRun(target.RunRequest{Threads: target.ThreadSet{Scope: target.ProcessThreads, Process: e.primary.ref}})
+	if !errors.Is(err, fault) || e.run != nil || e.sequence != 0 {
+		t.Fatalf("error=%v run=%+v sequence=%d", err, e.run, e.sequence)
+	}
+	for _, thread := range threads {
+		if thread.state != target.StateStopped {
+			t.Fatalf("thread resumed before extended register preflight: %+v", thread)
+		}
+		if _, err := e.requireThread(thread.token()); err != nil {
+			t.Fatalf("extended fault blocked stopped register inspection: %v", err)
+		}
+	}
+	if _, _, err := e.requireMemory(memory); err != nil {
+		t.Fatalf("extended fault invalidated memory: %v", err)
+	}
+	if err := e.resumeThread(&resumeAction{thread: threads[1]}, false); !errors.Is(err, fault) {
+		t.Fatalf("resume bypassed extended register fault: %v", err)
+	}
+}
+
 func TestModelWatchpointOwnershipIsNotCopiedToNewborn(t *testing.T) {
 	e, threads := controlModel(1)
 	parent := threads[0]
@@ -528,6 +554,243 @@ func TestControlWatchpointPendingPreventsResume(t *testing.T) {
 	}
 }
 
+func TestControlHardwareBreakpointIsNeverConsumedInternally(t *testing.T) {
+	for _, reason := range []target.StopReason{target.StopHardwareBreakpoint, target.StopStep} {
+		e, threads := controlModel(1)
+		thread := threads[0]
+		thread.state, thread.internalStepTrap = target.StateRunning, true
+		e.life.births = map[int]*birth{42001: {}}
+		handle := newRun(1)
+		action := &resumeAction{thread: thread, started: true}
+		e.run = &runOperation{handle: handle, actions: map[target.ThreadRef]*resumeAction{thread.ref: action}}
+		hit := target.HardwareBreakpointHit{
+			Ref: target.HardwareBreakpointRef{Thread: thread.ref, Slot: 0, Generation: 1}, Address: 0x401000,
+		}
+		stop := target.Stop{Reason: reason, StepCompleted: reason == target.StopStep, HardwareBreakpoints: []target.HardwareBreakpointHit{hit}}
+		e.onThreadStop(thread, stop)
+		if e.barrier == nil || !action.started || len(e.barrier.stop.HardwareBreakpoints) != 1 {
+			t.Fatalf("hardware execution fault was consumed: barrier=%+v action=%+v", e.barrier, action)
+		}
+		stop.HardwareBreakpoints[0].Address = 1
+		delete(e.life.births, 42001)
+		e.completeBarrier()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		result, err := handle.Wait(ctx)
+		cancel()
+		if err != nil || len(result.Stop.HardwareBreakpoints) != 1 || result.Stop.HardwareBreakpoints[0] != hit {
+			t.Fatalf("result=%+v error=%v", result, err)
+		}
+	}
+}
+
+func TestControlBreakpointSyscallIsNotSingleStepping(t *testing.T) {
+	e, threads := controlModel(1)
+	thread := threads[0]
+	e.run = &runOperation{handle: newRun(1), step: thread.ref, overThread: thread, actions: map[target.ThreadRef]*resumeAction{
+		thread.ref: {thread: thread, step: true, mode: resumeSyscall, started: true},
+	}}
+	if e.threadStepping(thread) {
+		t.Fatal("typed syscall tracing was treated as hardware single-step")
+	}
+	e.run.overThread = nil
+	if e.threadStepping(thread) {
+		t.Fatal("typed syscall exit obligation was treated as hardware single-step")
+	}
+}
+
+func TestControlRestartedSyscallRejectsNewStep(t *testing.T) {
+	e, threads := controlModel(1)
+	thread := threads[0]
+	pending := &breakpointSyscall{space: thread.process.space.ref, phase: syscallExit, needExit: true, restart: true}
+	thread.syscall = pending
+	_, err := e.startStep(target.StepRequest{Thread: thread.ref})
+	if !errors.Is(err, target.ErrUnsupported) || e.run != nil || e.sequence != 0 || thread.syscall != pending || thread.state != target.StateStopped {
+		t.Fatalf("error=%v run=%+v thread=%+v", err, e.run, thread)
+	}
+}
+
+func TestControlTypedSyscallExitFacts(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		restart   bool
+		interrupt bool
+		reason    target.StopReason
+		err       error
+	}{
+		{"completed", false, false, target.StopStep, nil},
+		{"interrupt", true, true, target.StopInterrupt, nil},
+		{"restart", true, false, target.StopUnknown, target.ErrUnsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, threads := controlModel(1)
+			thread := threads[0]
+			thread.state, thread.interruptRequested = target.StateRunning, tc.interrupt
+			pending := &breakpointSyscall{space: thread.process.space.ref, phase: syscallExit, needExit: true, restart: tc.restart}
+			thread.syscall = pending
+			e.life.births = map[int]*birth{42001: {}}
+			handle := newRun(1)
+			e.run = &runOperation{handle: handle, step: thread.ref, actions: map[target.ThreadRef]*resumeAction{
+				thread.ref: {thread: thread, step: true, mode: resumeSyscall, started: true},
+			}}
+			e.onThreadStop(thread, target.Stop{Reason: target.StopUnknown})
+			if e.barrier == nil || e.barrier.stop.Reason != tc.reason || e.barrier.stop.StepCompleted == tc.restart || !thread.needsUserBoundary {
+				t.Fatalf("barrier=%+v thread=%+v", e.barrier, thread)
+			}
+			if tc.restart && thread.syscall != pending || !tc.restart && thread.syscall != nil {
+				t.Fatalf("syscall obligation=%+v restart=%v", thread.syscall, tc.restart)
+			}
+			delete(e.life.births, 42001)
+			e.completeBarrier()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			result, err := handle.Wait(ctx)
+			cancel()
+			if !errors.Is(err, tc.err) || result.Stop.Reason != tc.reason || result.Stop.StepCompleted == tc.restart || result.Stop.RawDR6 != nil {
+				t.Fatalf("result=%+v error=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestControlBreakpointSyscallEntryHoldsPeers(t *testing.T) {
+	e, threads := controlModel(2)
+	owner, peer := threads[0], threads[1]
+	owner.state = target.StateRunning
+	owner.syscall = &breakpointSyscall{phase: syscallEntering, space: owner.process.space.ref}
+	e.run = &runOperation{handle: newRun(1), overThread: owner, actions: map[target.ThreadRef]*resumeAction{
+		owner.ref: {thread: owner, mode: resumeSyscall, started: true},
+		peer.ref:  {thread: peer},
+	}}
+	e.advanceRun()
+	if peer.state != target.StateStopped || e.run.actions[peer.ref].started || e.sequence != 0 {
+		t.Fatalf("peer resumed before syscall entry: peer=%+v run=%+v", peer, e.run)
+	}
+}
+
+func TestControlDeferredInterruptRetainsCommittedModeAndProof(t *testing.T) {
+	for _, mode := range []resumeMode{resumeContinue, resumeStep, resumeSyscall} {
+		e, threads := controlModel(1)
+		th := threads[0]
+		th.state = target.StateRunning
+		th.interruptDeferred, th.interruptResumed = true, true
+		proof := syscallStep{space: th.process.space.ref, pc: 0x401002, number: 56}
+		e.life.syscallSteps = map[*thread]syscallStep{th: proof}
+		e.life.cloneChildren = map[*thread]*thread{th: {}}
+		var pending *breakpointSyscall
+		if mode == resumeSyscall {
+			pending = &breakpointSyscall{space: th.process.space.ref, phase: syscallExecuting, needExit: true}
+			th.syscall = pending
+		}
+		action := &resumeAction{thread: th, step: mode != resumeContinue, mode: mode, started: true}
+		handle := newRun(1)
+		e.run = &runOperation{handle: handle, actions: map[target.ThreadRef]*resumeAction{th.ref: action}}
+		raw := "wait_status=0x80057f"
+		e.onThreadStop(th, target.Stop{Reason: target.StopInterrupt, Raw: raw})
+		if action.mode != mode || !errors.Is(action.resumeFailure, unix.ESRCH) || th.state != target.StateUnknown || e.barrier != nil {
+			t.Fatalf("mode=%d action=%+v thread=%+v barrier=%+v", mode, action, th, e.barrier)
+		}
+		if e.life.syscallSteps[th] != proof || e.life.cloneChildren[th] == nil || th.syscall != pending || th.interruptDeferred || th.interruptResumed {
+			t.Fatalf("deferred notification changed instruction proof: %+v", th)
+		}
+		if stop := e.snapshot().Threads[0].Stop; stop.Reason != target.StopUnknown || stop.StepCompleted || stop.Raw != raw {
+			t.Fatalf("snapshot published an unsolicited interrupt: %+v", stop)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		event, err := e.s.NextEvent(ctx, 0)
+		cancel()
+		if err != nil || event.Kind != target.EventThreadStopped || event.Stop.Reason != target.StopUnknown || event.Stop.StepCompleted || event.Stop.Raw != raw {
+			t.Fatalf("journal published an unsolicited interrupt: %+v error=%v", event, err)
+		}
+	}
+}
+
+func TestControlDeferredInterruptDoesNotConsumeAnotherStop(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reason    target.StopReason
+		resumed   bool
+		requested bool
+	}{
+		{"natural-breakpoint", target.StopBreakpoint, true, false},
+		{"signal", target.StopSignal, true, false},
+		{"group-stop", target.StopGroupStop, true, false},
+		{"new-interrupt", target.StopInterrupt, true, true},
+		{"new-request-natural", target.StopBreakpoint, true, true},
+		{"no-resume", target.StopInterrupt, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, threads := controlModel(1)
+			thread := threads[0]
+			thread.state = target.StateRunning
+			thread.interruptDeferred, thread.interruptResumed, thread.interruptRequested = true, tc.resumed, tc.requested
+			action := &resumeAction{thread: thread, mode: resumeContinue, started: true}
+			e.run = &runOperation{handle: newRun(1), actions: map[target.ThreadRef]*resumeAction{thread.ref: action}}
+			e.onThreadStop(thread, target.Stop{Reason: tc.reason})
+			if e.barrier == nil || e.barrier.stop.Reason != tc.reason || thread.stop.Reason != tc.reason || action.retry || !action.started || thread.interruptDeferred != tc.requested || thread.interruptResumed {
+				t.Fatalf("barrier=%+v thread=%+v action=%+v", e.barrier, thread, action)
+			}
+		})
+	}
+}
+
+func TestControlResumeESRCHWaitsForAuthoritativeExit(t *testing.T) {
+	e, threads := controlModel(1)
+	thread := threads[0]
+	memory, token := e.snapshot().Memory, thread.token()
+	handle := newRun(1)
+	action := &resumeAction{thread: thread}
+	e.run = &runOperation{handle: handle, actions: map[target.ThreadRef]*resumeAction{thread.ref: action}}
+	e.resumeFailed(action, &ptraceResumeError{err: unix.ESRCH})
+	if thread.state != target.StateUnknown || thread.exiting || thread.exitComplete || e.barrier != nil || action.started || action.mode != resumeNone || action.resumed || e.run.resumeCount != 0 {
+		t.Fatalf("resume failure was committed as success or exit: thread=%+v action=%+v run=%+v", thread, action, e.run)
+	}
+	if e.snapshot().Memory.Revision != 0 || thread.token() == token || thread.process.space.revision == memory.Revision {
+		t.Fatal("unknown resume outcome retained inspection tokens")
+	}
+	select {
+	case <-handle.done:
+		t.Fatal("ESRCH alone completed the run")
+	default:
+	}
+	code := 0
+	e.onThreadExit(thread, target.Stop{Reason: target.StopExited, ExitCode: &code})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := handle.Wait(ctx)
+	if err != nil || result.Stop.Reason != target.StopExited || result.Stop.ExitCode == nil || *result.Stop.ExitCode != 0 || e.s.State() != target.StateExited {
+		t.Fatalf("authoritative exit retained a provisional resume error: %+v error=%v", result, err)
+	}
+}
+
+func TestControlResumeESRCHIsNotInferredFromBackendFailure(t *testing.T) {
+	for _, actual := range []bool{false, true} {
+		e, threads := controlModel(1)
+		thread := threads[0]
+		e.life.births = map[int]*birth{42001: {}}
+		handle := newRun(1)
+		action := &resumeAction{thread: thread}
+		e.run = &runOperation{handle: handle, actions: map[target.ThreadRef]*resumeAction{thread.ref: action}}
+		err := error(unix.ESRCH)
+		if actual {
+			err = &ptraceResumeError{err: err}
+		}
+		e.resumeFailed(action, err)
+		if actual {
+			e.onThreadStop(thread, target.Stop{Reason: target.StopSignal})
+		}
+		if e.barrier == nil || !errors.Is(e.barrier.err, target.ErrPartial) || !errors.Is(e.barrier.err, unix.ESRCH) || thread.state != target.StateStopped || thread.exiting || thread.exitComplete {
+			t.Fatalf("unconfirmed failure was hidden: actual=%t barrier=%+v thread=%+v", actual, e.barrier, thread)
+		}
+		delete(e.life.births, 42001)
+		e.completeBarrier()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		result, err := handle.Wait(ctx)
+		cancel()
+		if !errors.Is(err, target.ErrPartial) || result.Stop.Reason == target.StopExited || result.Stop.Reason == target.StopSignaled {
+			t.Fatalf("nonterminal failure became terminal success: %+v error=%v", result, err)
+		}
+	}
+}
+
 func TestControlUserBoundaryIsNotSingleStepping(t *testing.T) {
 	e, threads := controlModel(1)
 	thread := threads[0]
@@ -538,6 +801,7 @@ func TestControlUserBoundaryIsNotSingleStepping(t *testing.T) {
 		t.Fatal("temporary boundary continue was treated as instruction stepping")
 	}
 	e.run.entryThread = nil
+	e.run.actions[thread.ref].mode = resumeStep
 	if !e.threadStepping(thread) {
 		t.Fatal("the original instruction step was lost after the boundary")
 	}

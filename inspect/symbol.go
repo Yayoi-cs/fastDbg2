@@ -257,6 +257,19 @@ func (index *SymbolIndex) checkModule(moduleID string) error {
 	return nil
 }
 
+func (index *SymbolIndex) Symbols(moduleID string) ([]Symbol, error) {
+	if err := index.checkModule(moduleID); err != nil {
+		return nil, err
+	}
+	var symbols []Symbol
+	for _, record := range index.records {
+		if moduleID == "" || record.symbol.ModuleID == moduleID {
+			symbols = append(symbols, record.symbol)
+		}
+	}
+	return symbols, nil
+}
+
 func (index *SymbolIndex) ResolveName(moduleID, name string) (Symbol, error) {
 	if name == "" {
 		return Symbol{}, fmt.Errorf("empty symbol name: %w", target.ErrInvalidArgument)

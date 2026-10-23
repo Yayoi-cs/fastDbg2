@@ -22,6 +22,7 @@ type lifecycleState struct {
 	terminal         target.State
 	signals          chan os.Signal
 	launch           *launchGate
+	childWaits       map[*process]*detachedChild
 	launchReleased   bool
 	launchExec       bool
 	attaching        bool
@@ -129,7 +130,7 @@ func taskIDs(tgid int) ([]int, error) {
 
 func traceOptions(owned bool) int {
 	options := unix.PTRACE_O_TRACECLONE | unix.PTRACE_O_TRACEFORK | unix.PTRACE_O_TRACEVFORK |
-		unix.PTRACE_O_TRACEVFORKDONE | unix.PTRACE_O_TRACEEXEC | unix.PTRACE_O_TRACEEXIT
+		unix.PTRACE_O_TRACEVFORKDONE | unix.PTRACE_O_TRACEEXEC | unix.PTRACE_O_TRACEEXIT | unix.PTRACE_O_TRACESYSGOOD
 	if owned {
 		options |= unix.PTRACE_O_EXITKILL
 	}
@@ -154,6 +155,9 @@ func (e *engine) launch(path string, args []string) error {
 	p.osProcess, p.profile, p.exeInfo = gate.process, gate.profile, gate.exeInfo
 	e.primary, e.s.pid = p, p.tgid
 	t := e.newThread(p, p.tgid, false)
+	if err := e.registerLaunchedChild(p); err != nil {
+		return err
+	}
 	if err := seize(t.tid, traceOptions(true)); err != nil {
 		return fmt.Errorf("seize launch gate: %w", err)
 	}
@@ -170,11 +174,24 @@ func (e *engine) attach(pid int) error {
 	if err != nil {
 		return err
 	}
-	fd, err := unix.PidfdOpen(status.tgid, 0)
+	child, err := e.claimLaunchedChild(status.tgid)
 	if err != nil {
-		return fmt.Errorf("pidfd_open: %w", err)
+		return err
+	}
+	fd := -1
+	if child != nil {
+		fd = child.pidfd
+	} else {
+		fd, err = unix.PidfdOpen(status.tgid, 0)
+		if err != nil {
+			return fmt.Errorf("pidfd_open: %w", err)
+		}
 	}
 	p := e.newProcess(status.tgid, fd, false)
+	if child != nil {
+		p.osProcess = child.process
+		e.bindLaunchedChild(p, child)
+	}
 	e.primary, e.s.pid, e.life.attaching = p, p.tgid, true
 	return e.scanAttach()
 }
@@ -186,7 +203,7 @@ func (e *engine) scanAttach() error {
 		return fmt.Errorf("enumerate process threads: %w", err)
 	}
 	for _, tid := range tids {
-		if t := e.threads[tid]; t != nil && t.live() {
+		if t := e.threads[tid]; t != nil && (t.live() || t.exitComplete && !t.seized && e.life.aliases[tid] == p) {
 			continue
 		}
 		auto := false
@@ -196,6 +213,13 @@ func (e *engine) scanAttach() error {
 			}
 			if !errors.Is(err, unix.EPERM) {
 				return fmt.Errorf("seize TID %d: %w", tid, err)
+			}
+			handled, aliasErr := e.registerZombieLeader(p, tid)
+			if aliasErr != nil {
+				return aliasErr
+			}
+			if handled {
+				continue
 			}
 			if ownerErr := unix.PtraceInterrupt(tid); ownerErr != nil {
 				return fmt.Errorf("seize TID %d: %w", tid, errors.Join(err, ownerErr))
@@ -494,6 +518,7 @@ func (e *engine) handleExec(t *thread, w waitResult) (*thread, error) {
 	}
 	t.state, t.listening = target.StateStopped, false
 	p := t.process
+	oldSpace := p.space
 	p.space = e.newSpace()
 	for tid, peer := range e.threads {
 		if peer.process != p {
@@ -514,7 +539,12 @@ func (e *engine) handleExec(t *thread, w waitResult) (*thread, error) {
 			delete(e.life.missing, tid)
 		}
 	}
+	if oldSpace != nil && !e.breakpointSpaceAlive(oldSpace) {
+		oldSpace.breakpoints = make(map[target.Address]*breakpoint)
+		oldSpace.stepping = nil
+	}
 	t.exiting, t.exitComplete, t.listening, t.groupStopped = false, false, false, false
+	t.extendedFault = nil
 	t.needsUserBoundary = true
 	if err := e.resetExecWatchpoints(t); err != nil {
 		return t, err
@@ -569,6 +599,9 @@ func (e *engine) handleWait(w waitResult) {
 	}
 	if w.status.Exited() || w.status.Signaled() {
 		stop := terminalStop(w)
+		if t.process != nil && t.tid == t.process.tgid {
+			e.childReaped(t.process, w.status)
+		}
 		e.forgetSyscallStep(t)
 		t.state, t.exiting, t.exitComplete, t.listening = target.StateExited, false, true, false
 		t.watchpoints = nil
@@ -603,6 +636,7 @@ func (e *engine) handleWait(w waitResult) {
 	wasListening := t.listening
 	t.state, t.listening = target.StateStopped, false
 	if wasListening && cause == unix.PTRACE_EVENT_STOP && w.status.StopSignal() == unix.SIGTRAP && !t.interruptRequested && e.life.shutdownKind == "" {
+		t.interruptDeferred, t.interruptResumed = false, false
 		t.groupStopped = false
 		if err := e.prepareWatchpointResume(t); err != nil {
 			e.unsupported = errors.Join(e.unsupported, err)
@@ -618,6 +652,7 @@ func (e *engine) handleWait(w waitResult) {
 		return
 	}
 	if e.life.launch != nil && e.life.initializing && !e.life.launchReleased {
+		t.interruptDeferred, t.interruptResumed = t.interruptRequested, false
 		if cause != unix.PTRACE_EVENT_STOP || w.status.StopSignal() != unix.SIGTRAP {
 			e.failInitialization(fmt.Errorf("unexpected launch gate stop: %w", target.ErrUnknown))
 			return
@@ -631,7 +666,11 @@ func (e *engine) handleWait(w waitResult) {
 			e.failInitialization(err)
 			return
 		}
+		t.interruptResumed = t.interruptDeferred
 		t.state, t.interruptRequested = target.StateRunning, false
+		return
+	}
+	if e.retryLaunchInterrupt(t, w) {
 		return
 	}
 	if cause == unix.PTRACE_EVENT_CLONE || cause == unix.PTRACE_EVENT_FORK || cause == unix.PTRACE_EVENT_VFORK {
@@ -648,6 +687,7 @@ func (e *engine) handleWait(w waitResult) {
 		}
 	}
 	if cause == unix.PTRACE_EVENT_EXIT {
+		t.interruptDeferred, t.interruptResumed = false, false
 		if code, err := unix.PtraceGetEventMsg(t.tid); err != nil {
 			e.unsupported = errors.Join(e.unsupported, err)
 		} else {
@@ -730,6 +770,10 @@ func (e *engine) handleWait(w waitResult) {
 }
 
 func (e *engine) advanceExits() {
+	if err := e.reapReleasedChildren(); err != nil {
+		e.unsupported = errors.Join(e.unsupported, err)
+		e.failRun(err)
+	}
 	wasWaiting := e.life.awaitProcessExit
 	e.observeProcessExit()
 	changed := wasWaiting && !e.life.awaitProcessExit
@@ -781,12 +825,6 @@ func (e *engine) lifecycleError() error {
 }
 
 func (e *engine) beginShutdown(kind string, reply chan error) {
-	if kind == "detach" && e.primary != nil && e.primary.owned {
-		if reply != nil {
-			reply <- fmt.Errorf("detaching launched children is not supported: %w", target.ErrUnsupported)
-		}
-		return
-	}
 	closeAfter := kind == "close"
 	if closeAfter {
 		kind = "detach"
@@ -833,14 +871,35 @@ func (e *engine) advanceShutdown() {
 	if e.life.shutdownKind == "" {
 		return
 	}
+	if err := e.reapReleasedChildren(); err != nil {
+		e.finishShutdown(err)
+		return
+	}
 	if e.allExited() {
+		if e.life.shutdownKind == "detach" && e.hasDetachedThreads() {
+			e.finishDetach()
+			return
+		}
 		if e.life.shutdownKind == "kill" {
 			for _, p := range e.processes {
 				if !processTerminated(p) {
+					if err := e.killShutdownProcess(p); err != nil {
+						e.finishShutdown(err)
+						return
+					}
 					e.life.awaitProcessExit = true
 					e.setState(target.StateRunning)
 					return
 				}
+			}
+			if err := e.reapReleasedChildren(); err != nil {
+				e.finishShutdown(err)
+				return
+			}
+			if !e.childWaitsComplete() {
+				e.life.awaitProcessExit = true
+				e.setState(target.StateRunning)
+				return
 			}
 		}
 		e.life.awaitProcessExit = false
@@ -873,15 +932,9 @@ func (e *engine) advanceShutdown() {
 			if e.life.killSent[p.tgid] || !e.processLive(p) {
 				continue
 			}
-			if p.pidfd < 0 {
-				errs = append(errs, fmt.Errorf("missing process handle %d: %w", p.tgid, target.ErrUnavailable))
-				continue
-			}
-			if err := unix.PidfdSendSignal(p.pidfd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+			if err := e.killShutdownProcess(p); err != nil {
 				errs = append(errs, err)
-				continue
 			}
-			e.life.killSent[p.tgid] = true
 		}
 		if len(errs) != 0 {
 			e.finishShutdown(errors.Join(errs...))
@@ -889,6 +942,10 @@ func (e *engine) advanceShutdown() {
 		return
 	}
 	if !e.allStopped() || len(e.life.births) != 0 {
+		return
+	}
+	if err := e.validateDetachResume(); err != nil {
+		e.finishShutdown(err)
 		return
 	}
 	for _, p := range e.processes {
@@ -902,15 +959,13 @@ func (e *engine) advanceShutdown() {
 			}
 		}
 	}
-	hasBreakpoints := false
-	for _, p := range e.processes {
-		hasBreakpoints = hasBreakpoints || p.space != nil && len(p.space.breakpoints) != 0
+	if err := e.validateDetachStops(); err != nil {
+		e.finishShutdown(err)
+		return
 	}
-	if hasBreakpoints {
-		if err := e.validateAllStop(); err != nil {
-			e.finishShutdown(err)
-			return
-		}
+	if err := e.prepareChildDetach(); err != nil {
+		e.finishShutdown(err)
+		return
 	}
 	if err := e.restoreBreakpoints(); err != nil {
 		if errors.Is(err, unix.ESRCH) {
@@ -954,12 +1009,88 @@ func (e *engine) advanceShutdown() {
 			errs = append(errs, fmt.Errorf("detach TID %d: %w", t.tid, err))
 			continue
 		}
-		t.state, t.listening = target.StateDetached, false
+		t.state, t.listening, t.seized = target.StateDetached, false, false
 		t.pendingSignal = 0
 		delete(e.life.births, t.tid)
 	}
 	if len(errs) != 0 {
 		e.finishShutdown(&target.PartialError{Op: "detach", Total: len(e.threads), Completed: e.detachedCount(), Err: errors.Join(errs...)})
+		return
+	}
+	e.finishDetach()
+}
+
+func (e *engine) killShutdownProcess(p *process) error {
+	if e.life.killSent[p.tgid] {
+		return nil
+	}
+	if p.pidfd < 0 {
+		return fmt.Errorf("missing process handle %d: %w", p.tgid, target.ErrUnavailable)
+	}
+	if err := unix.PidfdSendSignal(p.pidfd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return err
+	}
+	if e.life.killSent == nil {
+		e.life.killSent = make(map[int]bool)
+	}
+	e.life.killSent[p.tgid] = true
+	return nil
+}
+
+func (e *engine) hasDetachedThreads() bool {
+	for _, thread := range e.threads {
+		if thread.state == target.StateDetached {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *engine) validateDetachStops() error {
+	if !e.hasDetachedThreads() {
+		return e.validateAllStop()
+	}
+	for _, p := range e.processes {
+		if p.space != nil && (len(p.space.breakpoints) != 0 || p.space.stepping != nil) {
+			return fmt.Errorf("detached peers share unrestored software breakpoint state: %w", target.ErrUnavailable)
+		}
+	}
+	for _, t := range e.threads {
+		if t.hit != nil || t.suspended != nil {
+			return fmt.Errorf("detached peers share unresolved breakpoint recovery: %w", target.ErrUnavailable)
+		}
+		if !t.live() || t.exiting && t.exitComplete {
+			continue
+		}
+		if t.process == nil || !t.seized || t.state != target.StateStopped || t.listening {
+			return fmt.Errorf("remaining detach TID %d is not controlled: %w", t.tid, target.ErrUnavailable)
+		}
+		status, err := readTaskStatus(t.tid)
+		if err != nil {
+			return err
+		}
+		if status.tgid != t.process.tgid || status.tracer != e.life.tracer {
+			return fmt.Errorf("remaining detach TID %d changed ownership: %w", t.tid, target.ErrStale)
+		}
+		if _, err := readSignalInfo(t.tid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *engine) validateDetachResume() error {
+	for _, t := range e.threads {
+		if t.live() && !t.exiting && t.extendedFault != nil {
+			return fmt.Errorf("detach TID %d has unresolved extended register state: %w", t.tid, t.extendedFault)
+		}
+	}
+	return nil
+}
+
+func (e *engine) finishDetach() {
+	if err := e.handoffReleasedChildren(); err != nil {
+		e.finishShutdown(err)
 		return
 	}
 	e.life.terminal = target.StateDetached
@@ -979,6 +1110,9 @@ func (e *engine) detachedCount() int {
 }
 
 func (e *engine) finishShutdown(err error) {
+	if err == nil && (e.life.closeAfter || e.life.terminal == target.StateDetached) {
+		err = e.handoffReleasedChildren()
+	}
 	if err != nil && e.life.shutdownKind == "detach" {
 		e.invalidatePartialDetach()
 	}
@@ -988,6 +1122,8 @@ func (e *engine) finishShutdown(err error) {
 	if err != nil {
 		if !e.allExited() {
 			e.life.awaitProcessExit = false
+		} else {
+			e.observeProcessExit()
 		}
 		e.failRun(err)
 		e.updateState()
@@ -1028,7 +1164,16 @@ func (e *engine) release() {
 		e.life.launch.close()
 		e.life.launch = nil
 	}
+	e.handoffReleasedChildren()
 	for _, p := range e.processes {
+		if child := e.life.childWaits[p]; child != nil {
+			childWaitRegistry.Lock()
+			retained := !child.finished && p.osProcess != nil
+			childWaitRegistry.Unlock()
+			if retained {
+				continue
+			}
+		}
 		if p.pidfd >= 0 {
 			unix.Close(p.pidfd)
 			p.pidfd = -1
@@ -1106,7 +1251,7 @@ func processTerminated(p *process) bool {
 
 func (e *engine) detachExitingLeader(t *thread) (bool, error) {
 	p := t.process
-	if p == nil || p.owned || t.tid != p.tgid || e.life.shutdownKind == "kill" {
+	if p == nil || t.tid != p.tgid || e.life.shutdownKind == "kill" {
 		return false, nil
 	}
 	hasPeer := false

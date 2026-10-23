@@ -34,6 +34,16 @@ func Disassemble(arch target.Architecture, start target.Address, code []byte, li
 	var result []Instruction
 	for offset := 0; offset < len(code) && (limit == 0 || len(result) < limit); {
 		address := start + target.Address(offset)
+		if len(code)-offset >= 4 && code[offset] == 0xf3 && code[offset+1] == 0x0f && code[offset+2] == 0x1e &&
+			(code[offset+3] == 0xfa || code[offset+3] == 0xfb) {
+			text := "endbr64"
+			if code[offset+3] == 0xfb {
+				text = "endbr32"
+			}
+			result = append(result, Instruction{Address: address, Bytes: slices.Clone(code[offset : offset+4]), Text: text})
+			offset += 4
+			continue
+		}
 		inst, err := x86asm.Decode(code[offset:], 64)
 		if err != nil {
 			return result, fmt.Errorf("decode at %#x: %w", address, err)

@@ -343,6 +343,9 @@ func (e *engine) removeBreakpoint(bp *breakpoint) error {
 			t.hit = nil
 		}
 		if t.suspended == bp {
+			if t.syscall != nil && t.syscall.bp == bp && t.syscall.phase <= syscallEntry {
+				e.forgetBreakpointSyscall(t)
+			}
 			t.suspended = nil
 			if bp.space.stepping == t {
 				bp.space.stepping = nil
@@ -446,6 +449,9 @@ func (e *engine) abandonBreakpointStep(t *thread) error {
 		bp.space.breakpoints = make(map[target.Address]*breakpoint)
 	}
 	t.suspended = nil
+	if t.syscall != nil && t.syscall.bp == bp {
+		e.forgetBreakpointSyscall(t)
+	}
 	if bp.space.stepping == t {
 		bp.space.stepping = nil
 	}
@@ -512,6 +518,9 @@ func (e *engine) restoreBreakpoints() error {
 			space.breakpoints = make(map[target.Address]*breakpoint)
 			space.stepping = nil
 			for _, t := range e.threads {
+				if t.syscall != nil && t.syscall.space == space.ref {
+					e.forgetBreakpointSyscall(t)
+				}
 				if t.hit != nil && t.hit.bp.space == space {
 					t.hit = nil
 				}
@@ -544,6 +553,7 @@ func (e *engine) restoreBreakpoints() error {
 		for _, t := range e.threads {
 			if t.process != nil && t.process.space == space {
 				t.hit, t.suspended = nil, nil
+				e.forgetBreakpointSyscall(t)
 			}
 		}
 		space.breakpoints = make(map[target.Address]*breakpoint)

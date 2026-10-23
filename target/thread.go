@@ -105,4 +105,8 @@ type Capabilities struct {
 	HardwareWatchpoints      bool
 	WatchpointSlotsPerThread int
 	WatchpointSizes          []int
+	HardwareBreakpoints      bool
+	HardwareSlotsPerThread   int
+	ExtendedRegisters        bool
+	ExtendedRegisterFormats  []ExtendedRegisterFormat
 }

@@ -171,12 +171,16 @@ func (e *engine) writeRegisterSet(tid int, data []byte, count int) error {
 }
 
 func ptraceRegisterSet(request, pid int, data []byte) (int, error) {
+	return ptraceRegisterSetNote(request, pid, uintptr(elf.NT_PRSTATUS), data)
+}
+
+func ptraceRegisterSetNote(request, pid int, note uintptr, data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, target.ErrInvalidArgument
 	}
 	iov := unix.Iovec{Base: &data[0]}
 	iov.SetLen(len(data))
-	_, _, errno := unix.Syscall6(unix.SYS_PTRACE, uintptr(request), uintptr(pid), uintptr(elf.NT_PRSTATUS), uintptr(unsafe.Pointer(&iov)), 0, 0)
+	_, _, errno := unix.Syscall6(unix.SYS_PTRACE, uintptr(request), uintptr(pid), note, uintptr(unsafe.Pointer(&iov)), 0, 0)
 	runtime.KeepAlive(data)
 	if errno != 0 {
 		return 0, errno

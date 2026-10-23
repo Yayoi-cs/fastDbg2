@@ -585,6 +585,9 @@ func (p *nativeFixtureProcess) beginWait() {
 	p.waitOnce.Do(func() {
 		go func() {
 			p.err = p.command.Wait()
+			if err := p.command.Process.Release(); err != nil {
+				p.err = errors.Join(p.err, err)
+			}
 			close(p.waited)
 		}()
 	})

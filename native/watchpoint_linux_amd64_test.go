@@ -222,17 +222,17 @@ func TestWatchpointMixedStepAndMultipleHits(t *testing.T) {
 	}
 	image := state.current
 	image.status = debugStatusReserved | debugStep | 5
-	hits, step, raw, err := decodeWatchpointStop(state, image)
-	if err != nil || !step || raw != image.status || len(hits) != 2 || hits[0].Ref.Slot != 0 || hits[1].Ref.Slot != 2 {
+	hits, execution, step, raw, err := decodeWatchpointStop(state, image)
+	if err != nil || !step || raw != image.status || len(hits) != 2 || len(execution) != 0 || hits[0].Ref.Slot != 0 || hits[1].Ref.Slot != 2 {
 		t.Fatalf("hits=%+v step=%t dr6=%x error=%v", hits, step, raw, err)
 	}
 	image.status |= 2
-	if _, _, _, err := decodeWatchpointStop(state, image); !errors.Is(err, target.ErrUnsupported) {
+	if _, _, _, _, err := decodeWatchpointStop(state, image); !errors.Is(err, target.ErrUnsupported) {
 		t.Fatalf("unowned hardware cause consumed: %v", err)
 	}
 	image = state.current
 	image.control ^= 1 << 16
-	if _, _, _, err := decodeWatchpointStop(state, image); !errors.Is(err, target.ErrStale) {
+	if _, _, _, _, err := decodeWatchpointStop(state, image); !errors.Is(err, target.ErrStale) {
 		t.Fatalf("changed installed configuration accepted: %v", err)
 	}
 }

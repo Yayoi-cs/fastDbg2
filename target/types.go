@@ -87,6 +87,7 @@ const (
 	StopAttach
 	StopGroupStop
 	StopWatchpoint
+	StopHardwareBreakpoint
 )
 
 func (r StopReason) String() string {
@@ -117,23 +118,26 @@ func (r StopReason) String() string {
 		return "group-stop"
 	case StopWatchpoint:
 		return "watchpoint"
+	case StopHardwareBreakpoint:
+		return "hardware-breakpoint"
 	default:
 		return "unknown"
 	}
 }
 
 type Stop struct {
-	Reason        StopReason
-	ThreadID      *uint64
-	RawPC         *Address
-	Signal        Signal
-	ExitCode      *int
-	Breakpoint    *Address
-	Generation    uint64
-	Raw           string
-	Watchpoints   []WatchpointHit
-	StepCompleted bool
-	RawDR6        *uint64
+	Reason              StopReason
+	ThreadID            *uint64
+	RawPC               *Address
+	Signal              Signal
+	ExitCode            *int
+	Breakpoint          *Address
+	Generation          uint64
+	Raw                 string
+	Watchpoints         []WatchpointHit
+	StepCompleted       bool
+	RawDR6              *uint64
+	HardwareBreakpoints []HardwareBreakpointHit
 }
 
 type Register struct {
