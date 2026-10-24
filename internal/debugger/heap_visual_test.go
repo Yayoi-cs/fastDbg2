@@ -78,9 +78,9 @@ func TestHeapVisualCompleteRowsMembershipAndNextBits(t *testing.T) {
 	}
 	output := heapVisualTestRender(t, observation)
 	for _, want := range []string{
-		"[visual-heap]", "payload-policy=full including TOP", "+0x0000 | +0x0003", "chunk size=0x100 P=1 M=0 A=0; in-use bit clear (next.PREV_INUSE)",
-		"chunk size=0x30 P=0 M=0 A=0; in-use bit set (next.PREV_INUSE)", "| tcache thread=7 bin=2 (incomplete list) size=0x40",
-		"TOP size=0x1000", "* 254 lines, 0xfe0 bytes", "* 14 lines, 0xe0 bytes", "heap[0] headers=4 complete=true",
+		"|+0x00000|+0x00003:", "0x0000000000000101", "0x0000000000000030",
+		"| <- tcache thread=7 bin=2 (incomplete list)", "| <- top",
+		"* 254 lines, 0xfe0 bytes", "* 14 lines, 0xe0 bytes",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("missing %q in output:\n%s", want, output)
@@ -165,11 +165,7 @@ func TestHeapVisualSourceFencepostStopsBeforeForeignGap(t *testing.T) {
 					t.Fatalf("error=%v observation=%+v calls=%v", err, observation, fixture.stackCalls)
 				}
 				output := heapVisualTestRender(t, observation)
-				bit := "clear"
-				if flag != 0 {
-					bit = "set"
-				}
-				for _, want := range []string{"fencepost-sized boundary size=0x10", "foreign sbrk gap", "not fully inspected", "in-use bit " + bit + " (next.PREV_INUSE)"} {
+				for _, want := range []string{"| <- boundary", "foreign sbrk gap", "not fully inspected", fmt.Sprintf("0x%016x", uint64(16)+flag)} {
 					if !strings.Contains(output, want) {
 						t.Fatalf("missing %q:\n%s", want, output)
 					}
@@ -220,7 +216,7 @@ func TestHeapVisualValidatedHeapInfoTailContinuesToSuppliedCurrentTop(t *testing
 					}
 				}
 				output := heapVisualTestRender(t, observation)
-				for _, want := range []string{"validated heap_info fencepost", "validated heap_info terminal fencepost size=0x0", "heap[0] headers=3 complete=true", "heap[1] headers=1 complete=true", "TOP size=0x40"} {
+				for _, want := range []string{"| <- fencepost", "0x0000000000000001", "0x0000000000003000|", "0x0000000000001000|", "| <- top"} {
 					if !strings.Contains(output, want) {
 						t.Fatalf("missing %q:\n%s", want, output)
 					}
@@ -332,7 +328,7 @@ func TestHeapVisualMalformedOrUnprovenTailNeverSkipsToCurrentTop(t *testing.T) {
 				}
 			}
 			output := heapVisualTestRender(t, observation)
-			if !strings.Contains(output, "heap[1] headers=") || !strings.Contains(output, "incomplete") || strings.Contains(output, "TOP size=") {
+			if !strings.Contains(output, "[0x0000000000001000, 0x0000000000001040) is not fully inspected") || !strings.Contains(output, "incomplete") || strings.Contains(output, "| <- top") {
 				t.Fatal(output)
 			}
 		})
@@ -398,7 +394,7 @@ func TestHeapVisualNeverReadsSuccessorBeyondEndOrTop(t *testing.T) {
 				t.Fatalf("error=%v reads=%v observation=%+v", err, fixture.stackCalls, observation)
 			}
 			output := heapVisualTestRender(t, observation)
-			if test.top == 0 && !strings.Contains(output, "in-use bit unavailable (next header not confirmed)") || test.end > 0x1020 && !strings.Contains(output, "not traversed after declared TOP") {
+			if observation.extents[0].chunks[0].nextInUse != -1 || strings.Contains(output, "in-use bit") || strings.Contains(output, "not traversed") {
 				t.Fatal(output)
 			}
 		})
@@ -432,13 +428,13 @@ func TestHeapVisualPartialHeaderAndPayloadNeverPadOrRetry(t *testing.T) {
 					t.Fatalf("retried partial read: %v", fixture.stackCalls)
 				}
 				output := heapVisualTestRender(t, observation)
-				if stage == "header" && (strings.Contains(output, "TOP size=") || !strings.Contains(output, "not decoded")) {
+				if stage == "header" && (strings.Contains(output, "| <- top") || !strings.Contains(output, "not decoded")) {
 					t.Fatal(output)
 				}
 				if count > 0 && count < 8 && (!strings.Contains(output, "bytes["+strings.Repeat("fe", count)+"]") || strings.Contains(output, "0x00000000000000fe")) {
 					t.Fatalf("partial word invented:\n%s", output)
 				}
-				if !strings.Contains(output, "complete=false") || !strings.Contains(output, "incomplete") {
+				if observation.extents[0].complete || !strings.Contains(output, "incomplete") {
 					t.Fatal(output)
 				}
 			})
@@ -584,7 +580,7 @@ func TestHeapVisualExactRowCompressionAndControlSafety(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := heapVisualTestRender(t, observation)
-	for _, want := range []string{"* 2 lines, 0x20 bytes", "0x0000000000001040 | +0x0040", "ABCD....ABCDEFGH", "ABCD....ABCDEFG!", "heap\\nspoof", "| free\\x1b[2J\\nspoof; second (incomplete list) size=0x100"} {
+	for _, want := range []string{"* 2 lines, 0x20 bytes", "0x0000000000001040|+0x00040", "ABCD....ABCDEFGH", "ABCD....ABCDEFG!", "| <- free\\x1b[2J\\nspoof, second (incomplete list)"} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("missing %q:\n%s", want, plain)
 		}
@@ -621,7 +617,7 @@ func TestHeapVisualNormalPayloadBeyondOldPreviewIsRetained(t *testing.T) {
 				t.Fatalf("payload truncated: error=%v calls=%v bytes=%d", err, fixture.stackCalls, input.reader.bytes)
 			}
 			output := heapVisualTestRender(t, observation)
-			if !strings.Contains(output, "0x0000000000001700 | +0x0700") || !strings.Contains(output, "0x8877665544332211") || strings.Contains(output, "payload bytes omitted") {
+			if !strings.Contains(output, "0x0000000000001700|+0x00700") || !strings.Contains(output, "0x8877665544332211") || strings.Contains(output, "payload bytes omitted") {
 				t.Fatal(output)
 			}
 		})
@@ -630,12 +626,12 @@ func TestHeapVisualNormalPayloadBeyondOldPreviewIsRetained(t *testing.T) {
 
 func TestHeapVisualPaletteUsesVisualOrdinalForWholeRows(t *testing.T) {
 	var data []byte
-	for index := 0; index < 5; index++ {
+	for index := 0; index < 7; index++ {
 		data = append(data, heapVisualTestChunk(0x51)...)
 	}
 	input, _ := heapVisualTestInput(context.Background(), 0x1000, data)
 	input.reader.nodes = 29
-	observation, err := collectHeapVisual(input, []heapVisualExtent{{Base: 0x1000, Start: 0x1000, End: 0x1190}}, map[target.Address][]heapVisualMembership{0x1000: {{Label: "tcache[0]", Complete: true}}})
+	observation, err := collectHeapVisual(input, []heapVisualExtent{{Base: 0x1000, Start: 0x1000, End: 0x1230}}, map[target.Address][]heapVisualMembership{0x1000: {{Label: "tcache[0]", Complete: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +643,7 @@ func TestHeapVisualPaletteUsesVisualOrdinalForWholeRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	styles := []display.Style{display.StyleChanged, display.StyleCurrent, display.StyleRegister, display.StyleString, display.StyleChanged}
+	styles := []display.Style{display.StyleRed, display.StyleGreen, display.StyleYellow, display.StyleBlue, display.StylePurple, display.StyleCyan, display.StyleRed}
 	plain := heapVisualTestRender(t, observation)
 	for index, style := range styles {
 		if observation.extents[0].chunks[index].ordinal != index {
@@ -655,7 +651,7 @@ func TestHeapVisualPaletteUsesVisualOrdinalForWholeRows(t *testing.T) {
 		}
 		address := target.Address(0x1000 + index*0x50)
 		for _, line := range strings.Split(plain, "\n") {
-			if strings.HasPrefix(line, fmt.Sprintf("0x%016x |", address)) || strings.HasPrefix(line, fmt.Sprintf("0x%016x |", address+16)) || line == "    * 3 lines, 0x30 bytes" {
+			if strings.HasPrefix(line, fmt.Sprintf("0x%016x|", address)) || strings.HasPrefix(line, fmt.Sprintf("0x%016x|", address+16)) || line == "    * 3 lines, 0x30 bytes" {
 				painted := renderer.Text(style, line)
 				if !strings.Contains(colored, painted+"\n") || strings.Count(painted, "\x1b[") != 2 {
 					t.Fatalf("row not painted once with chunk style: %q\n%s", painted, colored)
@@ -663,29 +659,33 @@ func TestHeapVisualPaletteUsesVisualOrdinalForWholeRows(t *testing.T) {
 			}
 		}
 	}
-	if strings.Contains(plain, "list complete") || strings.Contains(plain, "; observed") || !strings.Contains(plain, "| tcache[0] size=0x50") || strings.Count(plain, "observed list links") != 1 {
+	if strings.Contains(plain, "list complete") || strings.Contains(plain, "; observed") || !strings.Contains(plain, "| <- tcache[0]") || strings.Contains(plain, "observed list links") {
 		t.Fatal(plain)
 	}
 }
 
-func TestHeapVisualCompactRowsPrecedeProvenanceFooter(t *testing.T) {
+func TestHeapVisualContainsOnlyRowsAndAnnotations(t *testing.T) {
 	data := append(heapVisualTestChunk(0x41), heapVisualTestChunk(0x41)...)
 	input, _ := heapVisualTestInput(context.Background(), 0x1000, data)
-	input.proof = "long exact allocator provenance"
-	observation, err := collectHeapVisual(input, []heapVisualExtent{{Base: 0xffd, Start: 0x1000, End: 0x1080, Top: 0x1040, Arena: 0x9000, Label: "long heap_info provenance"}}, map[target.Address][]heapVisualMembership{0x1000: {{Label: "tcache[0x40]", Complete: true}}})
+	input.proof = "internal provenance"
+	observation, err := collectHeapVisual(input, []heapVisualExtent{{Base: 0xffd, Start: 0x1000, End: 0x1080, Top: 0x1040, Arena: 0x9000, Label: "internal extent label"}}, map[target.Address][]heapVisualMembership{0x1000: {{Label: "tcache[0x40]", Complete: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	output := heapVisualTestRender(t, observation)
-	firstRow := strings.Index(output, "0x0000000000001000 |")
-	complete := strings.Index(output, "heap[0] headers=2 complete=true")
-	for _, footer := range []string{"long heap_info provenance", "provenance=", "global read budget=1048576 bytes", "Membership labels"} {
-		if strings.Index(output, footer) <= complete || complete <= firstRow || firstRow < 0 {
-			t.Fatalf("footer %q precedes rows:\n%s", footer, output)
-		}
+	want := "0x0000000000001000|+0x00000|+0x00003: 0x0000000000000000 0x0000000000000041 | ........A....... |\n" +
+		"0x0000000000001010|+0x00010|+0x00013: 0x4847464544434241 0x504f4e4d4c4b4a49 | ABCDEFGHIJKLMNOP | <- tcache[0x40]\n" +
+		"    * 2 lines, 0x20 bytes\n" +
+		"0x0000000000001040|+0x00000|+0x00043: 0x0000000000000000 0x0000000000000041 | ........A....... |\n" +
+		"0x0000000000001050|+0x00010|+0x00053: 0x4847464544434241 0x504f4e4d4c4b4a49 | ABCDEFGHIJKLMNOP | <- top\n" +
+		"    * 2 lines, 0x20 bytes\n"
+	if output != want {
+		t.Fatalf("unexpected visual heap output:\n%s\nwant:\n%s", output, want)
 	}
-	if !strings.Contains(output, "| tcache[0x40] size=0x40 P=1 M=0 A=0") || !strings.Contains(output, "| TOP size=0x40 P=1 M=0 A=0") || strings.Contains(output[:firstRow], "base=") {
-		t.Fatalf("facts or header not compact:\n%s", output)
+	for _, forbidden := range []string{"[visual-heap]", "heap[", "headers=", "complete=", "provenance", "payload-policy", "Membership", "Address", "internal"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("internal output %q: %s", forbidden, output)
+		}
 	}
 }
 
@@ -693,7 +693,7 @@ func TestHeapVisualCompressionNeverMergesPartialRow(t *testing.T) {
 	data := bytes.Repeat([]byte{0xab}, 40)
 	var output strings.Builder
 	err := renderHeapVisualRows(context.Background(), &output, display.Renderer{}, heapVisualExtent{Base: 0x1000}, 0x1000, 16, data, "", true, display.StyleChanged)
-	if err != nil || !strings.Contains(output.String(), "* 1 lines, 0x10 bytes") || !strings.Contains(output.String(), "0x0000000000001030 | +0x0030") || !strings.Contains(output.String(), "0xabababababababab <unavailable>") {
+	if err != nil || !strings.Contains(output.String(), "* 1 lines, 0x10 bytes") || !strings.Contains(output.String(), "0x0000000000001030|+0x00030") || !strings.Contains(output.String(), "0xabababababababab <unavailable>") {
 		t.Fatalf("partial row compression: error=%v output=%s", err, output.String())
 	}
 }
@@ -707,7 +707,7 @@ func TestHeapVisualExtentOrderRemainsCallerDefined(t *testing.T) {
 		t.Fatalf("error=%v calls=%v", err, fixture.stackCalls)
 	}
 	output := heapVisualTestRender(t, observation)
-	if !strings.Contains(output, "heap[0] base=0x0000000000001020 \"second\"") || !strings.Contains(output, "heap[1] base=0x0000000000001000 \"first\"") || strings.Count(output, "next header not confirmed") != 2 {
+	if !strings.HasPrefix(output, "0x0000000000001020|") || strings.Index(output, "0x0000000000001000|") <= strings.Index(output, "0x0000000000001020|") {
 		t.Fatal(output)
 	}
 }
@@ -722,7 +722,7 @@ func TestHeapVisualIncompletePrefixListsAllUnvisitedExtents(t *testing.T) {
 		t.Fatalf("error=%v calls=%v observation=%+v", err, fixture.stackCalls, observation)
 	}
 	output := heapVisualTestRender(t, observation)
-	if !strings.Contains(output, "heap[1] base=0x0000000000001020 \"unvisited\"") || !strings.Contains(output, "heap[1] headers=0 complete=false") || !strings.Contains(output, "[0x0000000000001020, 0x0000000000001040) is not fully inspected") {
+	if !strings.Contains(output, "[0x0000000000001020, 0x0000000000001040) is not fully inspected") {
 		t.Fatal(output)
 	}
 }
@@ -801,7 +801,7 @@ func TestHeapVisualNativeSmallChunkAtUnmappedGuardPage(t *testing.T) {
 					t.Fatalf("read outside exact chunk: %+v", call)
 				}
 			}
-			if text := heapVisualTestRender(t, observation); !strings.Contains(text, "TOP size=0x20") || !strings.Contains(text, "complete=true") {
+			if text := heapVisualTestRender(t, observation); !strings.Contains(text, "| <- top") || !strings.Contains(text, "0x0000000000000021") || strings.Contains(text, "complete=") {
 				t.Fatal(text)
 			}
 			after, err := controller.session.Snapshot()

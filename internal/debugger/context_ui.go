@@ -42,8 +42,8 @@ func (c *Controller) addAddressSymbols(ctx context.Context, snapshot target.Snap
 		return err
 	}
 	walker.symbol = func(address target.Address) string {
-		var exact, containing []string
-		seen := make(map[string]bool)
+		var best string
+		var bestExact bool
 		for i := range symbols {
 			symbol := &symbols[i]
 			if !symbol.AddressKnown || symbol.Section == elf.SHN_ABS || symbol.Name == "" || address < symbol.Address ||
@@ -54,27 +54,12 @@ func (c *Controller) addAddressSymbols(ctx context.Context, snapshot target.Snap
 			if address != symbol.Address {
 				label += fmt.Sprintf("+0x%x", address-symbol.Address)
 			}
-			if seen[label] {
-				continue
-			}
-			seen[label] = true
-			if address == symbol.Address {
-				exact = append(exact, label)
-			} else {
-				containing = append(containing, label)
+			exact := address == symbol.Address
+			if best == "" || exact && !bestExact || exact == bestExact && uiCompareSymbolLabels(label, best) < 0 {
+				best, bestExact = label, exact
 			}
 		}
-		if len(seen) == 0 {
-			return ""
-		}
-		slices.SortFunc(exact, uiCompareSymbolLabels)
-		slices.SortFunc(containing, uiCompareSymbolLabels)
-		labels := append(exact, containing...)
-		text := strings.Join(labels[:min(3, len(labels))], " | ")
-		if len(labels) > 3 {
-			text += fmt.Sprintf(" | +%d more", len(labels)-3)
-		}
-		return text
+		return best
 	}
 	return nil
 }
@@ -172,6 +157,7 @@ func (c *Controller) contextUIView(ctx context.Context, snapshot target.Snapshot
 			return err
 		},
 		renderer: c.renderer,
+		arch:     snapshot.Architecture,
 		width:    width,
 		ctx:      ctx,
 		prepare: func(registers []target.Register) (*addressWalker, error) {
@@ -184,6 +170,7 @@ func (c *Controller) contextUIView(ctx context.Context, snapshot target.Snapshot
 }
 
 var uiRegisterOrder = []string{
+	"eax", "ebx", "ecx", "edx", "esp", "ebp", "esi", "edi", "eip", "orig_eax",
 	"rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi", "rip",
 	"r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "orig_rax", "fs_base", "gs_base", "eflags",
 	"cs", "ss", "ds", "es", "fs", "gs",
@@ -246,16 +233,26 @@ func (view contextOutput) legend() error {
 }
 
 func (view contextOutput) instructionText(instruction inspect.Instruction) string {
-	text := contextEscapedText(instruction.Text)
+	text := view.renderer.Text(display.StylePurple, contextEscapedText(instruction.Text))
 	if view.walker == nil || view.walker.symbol == nil {
 		return text
 	}
-	decoded, err := x86asm.Decode(instruction.Bytes, 64)
+	decoded, err := x86asm.Decode(instruction.Bytes, view.abi().bits)
 	if err != nil || decoded.Len != len(instruction.Bytes) {
 		return text
 	}
 	relative, ok := decoded.Args[0].(x86asm.Rel)
 	if !ok || uint64(decoded.Len) > math.MaxUint64-uint64(instruction.Address) {
+		return text
+	}
+	if view.abi().arch == target.X86 {
+		address := uint32(instruction.Address) + uint32(decoded.Len) + uint32(relative)
+		if decoded.DataSize == 16 && decoded.Op != x86asm.XBEGIN {
+			address &= 0xffff
+		}
+		if label := view.walker.symbol(target.Address(address)); label != "" {
+			text += " " + view.renderer.Text(display.StyleSymbol, "<"+contextEscapedText(label)+">")
+		}
 		return text
 	}
 	address := uint64(instruction.Address) + uint64(decoded.Len)
@@ -280,28 +277,28 @@ func (view contextOutput) instructionText(instruction inspect.Instruction) strin
 
 func (view contextOutput) rawStackRows(registers []target.Register, start target.Address, data []byte) error {
 	values := uiRegisterValues(registers)
-	for offset := 0; offset < len(data); offset += 8 {
+	for offset := 0; offset < len(data); offset += view.abi().word {
 		address := start + target.Address(offset)
 		var labels []string
-		for _, name := range []string{"rsp", "rbp"} {
+		for _, name := range []string{view.abi().sp, view.abi().bp} {
 			if value, exists := values[name]; exists && value == uint64(address) {
 				labels = append(labels, "$"+name+">")
 			}
 		}
 		label := strings.Join(labels, ",")
 		if len(labels) == 2 {
-			label = "$rsp/rbp>"
+			label = "$" + view.abi().sp + "/" + view.abi().bp + ">"
 		}
-		where, err := view.renderer.Address(target.AMD64, address, display.AddressStack)
+		where, err := view.renderer.Address(view.abi().arch, address, display.AddressStack)
 		if err != nil {
 			return err
 		}
-		row := data[offset:min(offset+8, len(data))]
+		row := data[offset:min(offset+view.abi().word, len(data))]
 		value := "<partial bytes: " + display.FormatBytes(row) + ">"
-		if len(row) == 8 {
-			value = fmt.Sprintf("0x%016x", inspectionWord(row))
+		if len(row) == view.abi().word {
+			value = fmt.Sprintf("0x%0*x", view.abi().word*2, inspectionWord(row))
 		}
-		if err := view.writef("%-9s %s|+0x%04x|+%03d: %s\n", label, where, offset, offset/8, value); err != nil {
+		if err := view.writef("%-9s %s|+0x%04x|+%03d: %s\n", label, where, offset, offset/view.abi().word, value); err != nil {
 			return err
 		}
 	}

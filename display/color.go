@@ -6,7 +6,7 @@ import (
 	"fastdbg2/target"
 )
 
-const codeColor = "31"
+const codeColor = "35"
 
 type ColorMode uint8
 
@@ -36,6 +36,12 @@ const (
 	StyleSymbol
 	StyleFlagSet
 	StyleString
+	StyleRed
+	StyleGreen
+	StyleYellow
+	StyleBlue
+	StylePurple
+	StyleCyan
 )
 
 type Renderer struct {
@@ -58,24 +64,28 @@ func NewRenderer(options Options) (Renderer, error) {
 func (r Renderer) Text(style Style, text string) string {
 	var code string
 	switch style {
-	case StyleHeading:
-		code = "1"
 	case StyleError:
 		code = "31"
-	case StyleMuted:
-		code = "2"
-	case StyleRegister:
-		code = "1;34"
 	case StyleChanged:
-		code = "1;31"
+		code = "31"
 	case StyleCurrent:
-		code = "1;32"
+		code = "32"
 	case StyleSymbol:
 		code = "36"
 	case StyleFlagSet:
-		code = "1;32"
-	case StyleString:
+		code = "32"
+	case StyleString, StyleYellow:
 		code = "33"
+	case StyleRed:
+		code = "31"
+	case StyleGreen:
+		code = "32"
+	case StyleBlue:
+		code = "34"
+	case StylePurple:
+		code = "35"
+	case StyleCyan:
+		code = "36"
 	}
 	return r.paint(code, text)
 }

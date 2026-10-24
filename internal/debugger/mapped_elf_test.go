@@ -226,7 +226,7 @@ func TestMappedELFLiveMainAndLibraries(t *testing.T) {
 				}
 				if metadataAvailable {
 					fixture.output.Reset()
-					if err := command(context.Background(), "all"); err != nil || !strings.Contains(fixture.output.String(), "loader/runtime-dynamic") {
+					if err := command(context.Background(), "all"); err != nil || !strings.Contains(fixture.output.String(), "Runtime") {
 						t.Fatalf("all metadata: error=%v output=%q", err, fixture.output.String())
 					}
 				}
@@ -234,10 +234,10 @@ func TestMappedELFLiveMainAndLibraries(t *testing.T) {
 			fixture.output.Reset()
 			stdioErr := controller.showStdio(context.Background(), "")
 			if !metadataAvailable {
-				if !errors.Is(stdioErr, target.ErrPartial) || !errors.Is(stdioErr, target.ErrUnavailable) || !errors.Is(stdioErr, unix.EPERM) || errors.Is(stdioErr, target.ErrNotFound) || !strings.Contains(fixture.output.String(), "Stdio symbol scan incomplete") || strings.Contains(fixture.output.String(), "declared-size=") {
+				if !errors.Is(stdioErr, target.ErrPartial) || !errors.Is(stdioErr, target.ErrUnavailable) || !errors.Is(stdioErr, unix.EPERM) || fixture.output.Len() != 0 {
 					t.Fatalf("unproven stdio: error=%v output=%q", stdioErr, fixture.output.String())
 				}
-			} else if stdioErr != nil || strings.Count(fixture.output.String(), "declared-size=") != 3 {
+			} else if stdioErr != nil || !strings.Contains(fixture.output.String(), "[FILE->_wide_data->_wide_vtable]") {
 				t.Fatalf("proven stdio: error=%v output=%q", stdioErr, fixture.output.String())
 			}
 		})

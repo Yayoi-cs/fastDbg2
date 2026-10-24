@@ -359,7 +359,7 @@ func TestSearchCommandsReadExactTokenAndLiteralString(t *testing.T) {
 	if err := c.commandSearch(context.Background(), "search-string", args); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Source     : live-raw", "2 confirmed byte match(es)", fmt.Sprintf("0x%016x", mapping.Start+2), fmt.Sprintf("0x%016x", mapping.Start+15), "Status     : complete"} {
+	for _, want := range []string{"Found ", "Found 2 match(es)", fmt.Sprintf("0x%016x", mapping.Start+2), fmt.Sprintf("0x%016x", mapping.Start+15), "match(es)\n"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing %q: %s", want, output.String())
 		}
@@ -376,7 +376,7 @@ func TestSearchCommandsValueWidthAndOverflow(t *testing.T) {
 	for _, flags := range []string{"", "--size 4", "--size 4 --endian big"} {
 		output.Reset()
 		args := fmt.Sprintf("%s 0x4142 %#x %#x", flags, mapping.Start, mapping.Start+8)
-		if err := c.commandSearch(context.Background(), "search-value", args); err != nil || !strings.Contains(output.String(), "1 confirmed byte match(es)") {
+		if err := c.commandSearch(context.Background(), "search-value", args); err != nil || !strings.Contains(output.String(), "Found 1 match(es)") {
 			t.Fatalf("flags=%s output=%s err=%v", flags, output.String(), err)
 		}
 	}
@@ -396,7 +396,7 @@ func TestSearchCommandStalePartialAndOutputErrors(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Fatal(err)
 		}
-		if failure == target.ErrStale && output.Len() != 0 || failure == syscall.EIO && !strings.Contains(output.String(), "3 confirmed byte match(es)") {
+		if failure == target.ErrStale && output.Len() != 0 || failure == syscall.EIO && !strings.Contains(output.String(), "Found 3 match(es)") {
 			t.Fatalf("failure=%v output=%s", failure, output.String())
 		}
 	}
@@ -433,14 +433,14 @@ func TestFindructionUsesLogicalCodeAndRejectsRelocations(t *testing.T) {
 	if err := c.commandSearch(context.Background(), "findruction", args); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Source     : live-logical") || !strings.Contains(output.String(), "1 confirmed byte match(es)") || !strings.Contains(output.String(), fmt.Sprintf("0x%016x", mapping.Start+1)) {
+	if !strings.Contains(output.String(), "findruction — 1 match(es)") || !strings.Contains(output.String(), fmt.Sprintf("0x%016x", mapping.Start+1)) {
 		t.Fatal(output.String())
 	}
-	if len(session.codeTokens) != 1 || session.codeTokens[0] != session.snapshot.Memory || len(session.rawTokens) != 0 {
+	if len(session.codeTokens) != 2 || session.codeTokens[0] != session.snapshot.Memory || session.codeTokens[1] != session.snapshot.Memory || len(session.rawTokens) != 0 {
 		t.Fatalf("raw=%v code=%v", session.rawTokens, session.codeTokens)
 	}
 	output.Reset()
-	if err := c.commandSearch(context.Background(), "findruction", `"call missing_search_symbol"`); err == nil || output.Len() != 0 || len(session.codeTokens) != 1 {
+	if err := c.commandSearch(context.Background(), "findruction", `"call missing_search_symbol"`); err == nil || output.Len() != 0 || len(session.codeTokens) != 2 {
 		t.Fatalf("output=%s err=%v", output.String(), err)
 	}
 }
@@ -481,7 +481,7 @@ func TestFindructionOfflineELFReportsOnlyUnrelocatedFileFacts(t *testing.T) {
 	if err := c.commandSearch(context.Background(), "findruction", `"nop; nop"`); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Source     : file-unrelocated", "1 confirmed byte match(es)", "elf-vaddr=0x0000000000004001 file-offset=0x101"} {
+	for _, want := range []string{"elf-vaddr=", "1 match(es)", "elf-vaddr=0x0000000000004001 file-offset=0x101"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing %q: %s", want, output.String())
 		}
@@ -514,7 +514,7 @@ func TestSearchOfflineELFQuotaIsExplicit(t *testing.T) {
 		output := new(bytes.Buffer)
 		c := &Controller{out: output, path: searchELFFixture(t, nil)}
 		err := c.searchConfiguredELF(context.Background(), []byte{0x90}, limits)
-		if !errors.Is(err, target.ErrPartial) || !errors.Is(err, target.ErrOverflow) || !strings.Contains(output.String(), "Status     : partial") || !strings.Contains(output.String(), "1 confirmed byte match(es)") {
+		if !errors.Is(err, target.ErrPartial) || !errors.Is(err, target.ErrOverflow) || !strings.Contains(output.String(), "(partial)") || !strings.Contains(output.String(), "1 match(es)") {
 			t.Fatalf("limits=%#v output=%s err=%v", limits, output.String(), err)
 		}
 	}
@@ -531,13 +531,18 @@ func TestSearchLiveNativeETEXECAndPIE(t *testing.T) {
 				`findruction "nop; nop; ret" expansion_point "expansion_point + 3"`,
 			} {
 				output := fixture.command(t, command)
-				if !strings.Contains(output, "1 confirmed byte match(es)") || !strings.Contains(output, "Status     : complete") {
+
+				expected := "Found 1 match(es)\n"
+				if strings.HasPrefix(command, "findruction") {
+					expected = "findruction — 1 match(es)"
+				}
+				if !strings.Contains(output, expected) {
 					t.Fatalf("%s: %s", command, output)
 				}
 			}
 			fixture.command(t, "continue")
 			output := fixture.command(t, `findruction "nop; nop; ret" expansion_point "expansion_point + 3"`)
-			if !strings.Contains(output, "Source     : live-logical") || !strings.Contains(output, "1 confirmed byte match(es)") || !strings.Contains(output, "Status     : complete") {
+			if !strings.Contains(output, "1 match(es)") {
 				t.Fatal(output)
 			}
 		})

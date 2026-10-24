@@ -86,6 +86,9 @@ func (c *Controller) retryUninstalledBreakpoints(ctx context.Context, pending bo
 }
 
 func (c *Controller) prepareLoaderBreakpoints(ctx context.Context) error {
+	if _, ok := c.session.(*qemuSession); ok {
+		return c.retryUninstalledBreakpoints(ctx, false)
+	}
 	if len(c.breakpoints) != 0 || c.loaderBreakpoint != nil {
 		if _, _, err := c.stopped(); err != nil {
 			return err

@@ -179,7 +179,7 @@ func TestDisassembleUsesCurrentLogicalLocation(t *testing.T) {
 		len(fixture.stackCalls) != 0 {
 		t.Fatalf("unexpected disassembly calls: %+v", fixture)
 	}
-	for _, want := range []string{"[disassembly]", "raw-pc=0x0000000000401001 instruction-pc=0x0000000000401000", "=> 0x0000000000401000"} {
+	for _, want := range []string{"[disassembly]", "=> 0x0000000000401000"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing %q: %q", want, output.String())
 		}

@@ -83,14 +83,17 @@ var allocatorProfilesError error
 
 func knownAllocatorProfiles() ([]allocatorProfile, error) {
 	allocatorProfilesOnce.Do(func() {
-		profile, err := parseAllocatorProfile([]byte(builtInAllocatorProfile))
-		if err != nil {
-			allocatorProfilesError = err
-			return
-		}
-		allocatorProfilesError = validateAllocatorProfile(profile)
-		if allocatorProfilesError == nil {
-			allocatorProfilesValue = []allocatorProfile{profile}
+		for _, raw := range []string{builtInAllocatorProfile, builtInX86AllocatorProfile} {
+			profile, err := parseAllocatorProfile([]byte(raw))
+			if err != nil {
+				allocatorProfilesError = err
+				return
+			}
+			if err := validateAllocatorProfile(profile); err != nil {
+				allocatorProfilesError = err
+				return
+			}
+			allocatorProfilesValue = append(allocatorProfilesValue, profile)
 		}
 	})
 	return allocatorProfilesValue, allocatorProfilesError
@@ -134,19 +137,28 @@ func validateAllocatorProfile(profile allocatorProfile) error {
 	if err := profile.Layout.Validate(); err != nil {
 		return err
 	}
+	word := profile.Layout.Pointer
+	minimum := uint64(32)
+	heapMax := uint64(1 << 26)
+	fastShift := uint64(4)
+	if word == 4 {
+		minimum = 16
+		heapMax = 1 << 20
+		fastShift = 3
+	}
 	constants := profile.Constants
 	largeBins := uint64(0)
 	if profile.Semantics.TcacheCounterMode == "num_slots" {
 		largeBins = 12
 	}
-	if constants.Alignment != 16 || constants.HeapMaxSize != 1<<26 || constants.MinChunkSize != 32 || constants.ChunkHeaderSize != 16 || constants.SizeFlags != 7 ||
+	if constants.Alignment != 16 || constants.HeapMaxSize != heapMax || constants.MinChunkSize != minimum || constants.ChunkHeaderSize != 2*word || constants.SizeFlags != 7 ||
 		constants.TcacheSmallBinCount != 64 || constants.TcacheLargeBinCount != largeBins ||
 		profile.Layout.Tcache == nil || profile.Layout.TcacheEntry == nil || constants.TcacheSmallBinCount+constants.TcacheLargeBinCount != profile.Layout.Tcache.Fields["entries"].Count ||
 		constants.SmallBinCount != 64 || constants.NormalBinCount != 128 || profile.Layout.Arena.Fields["bins"].Count != 2*(constants.NormalBinCount-1) {
 		return fmt.Errorf("invalid allocator profile constants: %w", target.ErrInvalidArgument)
 	}
 	_, hasFast := profile.Layout.Arena.Fields["fastbinsY"]
-	if hasFast != source.Fastbins || hasFast && (constants.FastBinShift != 4 || profile.Layout.FastLink != "safe-link-12") || !hasFast && (constants.FastBinShift != 0 || profile.Layout.FastLink != "") {
+	if hasFast != source.Fastbins || hasFast && (constants.FastBinShift != fastShift || profile.Layout.FastLink != "safe-link-12") || !hasFast && (constants.FastBinShift != 0 || profile.Layout.FastLink != "") {
 		return fmt.Errorf("allocator fastbin metadata differs from reviewed source: %w", target.ErrInvalidArgument)
 	}
 	if field, exists := profile.Layout.Tcache.Fields[profile.Semantics.TcacheCounterMode]; !exists || field.Width != 2 {
@@ -157,7 +169,7 @@ func validateAllocatorProfile(profile allocatorProfile) error {
 			return target.ErrInvalidArgument
 		}
 		for name, field := range record.Fields {
-			if field.Count != 1 || field.Width != 8 || field.Stride != 8 || field.Offset > record.Size || field.Width > record.Size-field.Offset || name == "" {
+			if field.Count != 1 || field.Width != word || field.Stride != word || field.Offset > record.Size || field.Width > record.Size-field.Offset || name == "" {
 				return fmt.Errorf("invalid allocator auxiliary record field %q: %w", name, target.ErrInvalidArgument)
 			}
 		}
@@ -172,7 +184,7 @@ func validateAllocatorProfile(profile allocatorProfile) error {
 			return fmt.Errorf("missing heap_info field %q: %w", name, target.ErrInvalidArgument)
 		}
 	}
-	for name, width := range map[string]uint64{"main_arena": profile.Layout.Arena.Size, "mp_": profile.MallocPar.Size, "tcache": 8, "thread_arena": 8} {
+	for name, width := range map[string]uint64{"main_arena": profile.Layout.Arena.Size, "mp_": profile.MallocPar.Size, "tcache": word, "thread_arena": word} {
 		symbol, ok := profile.Symbols[name]
 		wantType := uint64(1)
 		if name == "tcache" || name == "thread_arena" {
@@ -193,11 +205,11 @@ func validateAllocatorProfile(profile allocatorProfile) error {
 		return fmt.Errorf("invalid allocator TLS profile: %w", target.ErrInvalidArgument)
 	}
 	for _, field := range [][3]uint64{
-		{tls.ThreadSelfOffset, 8, tls.TCBSize}, {tls.ThreadTCBOffset, 8, tls.TCBSize}, {tls.ThreadDTVOffset, 8, tls.TCBSize}, {tls.ThreadTIDOffset, 4, tls.ThreadSize},
-		{tls.DTVPointerOffset, 8, tls.DTVEntrySize}, {tls.DTVGenerationOffset, 8, tls.DTVEntrySize},
-		{tls.LinkMapModIDOffset, 8, tls.LinkMapSize}, {tls.LinkMapStaticOffset, 8, tls.LinkMapSize}, {tls.LinkMapBlockSizeOffset, 8, tls.LinkMapSize},
-		{tls.SlotGenerationOffset, 8, tls.SlotEntrySize}, {tls.SlotMapOffset, 8, tls.SlotEntrySize}, {tls.SlotListLengthOffset, 8, tls.SlotListSize}, {tls.SlotListNextOffset, 8, tls.SlotListSize},
-		{tls.RTLDGenerationOffset, 8, profile.Symbols["_rtld_global"].Size}, {tls.RTLDSlotInfoOffset, 8, profile.Symbols["_rtld_global"].Size},
+		{tls.ThreadSelfOffset, word, tls.TCBSize}, {tls.ThreadTCBOffset, word, tls.TCBSize}, {tls.ThreadDTVOffset, word, tls.TCBSize}, {tls.ThreadTIDOffset, 4, tls.ThreadSize},
+		{tls.DTVPointerOffset, word, tls.DTVEntrySize}, {tls.DTVGenerationOffset, word, tls.DTVEntrySize},
+		{tls.LinkMapModIDOffset, word, tls.LinkMapSize}, {tls.LinkMapStaticOffset, word, tls.LinkMapSize}, {tls.LinkMapBlockSizeOffset, word, tls.LinkMapSize},
+		{tls.SlotGenerationOffset, word, tls.SlotEntrySize}, {tls.SlotMapOffset, word, tls.SlotEntrySize}, {tls.SlotListLengthOffset, word, tls.SlotListSize}, {tls.SlotListNextOffset, word, tls.SlotListSize},
+		{tls.RTLDGenerationOffset, word, profile.Symbols["_rtld_global"].Size}, {tls.RTLDSlotInfoOffset, word, profile.Symbols["_rtld_global"].Size},
 	} {
 		if field[2] == 0 || field[2] > 65536 || field[0] > field[2] || field[1] > field[2]-field[0] {
 			return fmt.Errorf("allocator TLS field exceeds its exact DWARF record: %w", target.ErrInvalidArgument)

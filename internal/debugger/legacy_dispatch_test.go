@@ -141,7 +141,7 @@ func TestLegacyColorLegendUsesExistingRendererPolicy(t *testing.T) {
 		c := New(&output, renderer)
 		executeController(t, c, "COLOR", "")
 		text := output.String()
-		if strings.ContainsRune(text, '\x1b') != test.color || !strings.Contains(text, "not inferred") || !strings.Contains(text, "rwx") || c.session != nil {
+		if strings.ContainsRune(text, '\x1b') != test.color || strings.Contains(text, "not inferred") || !strings.Contains(text, "rwx") || c.session != nil {
 			t.Fatalf("legend changed policy or inferred permissions: %q", text)
 		}
 	}
@@ -164,15 +164,15 @@ func TestLegacyHelpExplainsExactScopeAndCompatibility(t *testing.T) {
 		{"XMM", []string{"full SIMD", "0..15"}},
 		{"CHECKSEC", []string{"symbol evidence", "does not prove runtime"}},
 		{"GOT", []string{"No index-times-16", "unreadable-as-zero"}},
-		{"STDIO-DUMP", []string{"raw symbol-object", "not a guessed"}},
+		{"STDIO-DUMP", []string{"matching libc DWARF", "wide vtables", "rather than guessed", "pager"}},
 		{"fs", []string{"128 raw bytes", "No automatic canary"}},
 		{"tel", []string{"--depth", "cycles", "NUL-terminated", "unicode.IsPrint"}},
 		{"findruction", []string{"do not prove instruction boundaries", "not asserted runtime"}},
 		{"asm", []string{"never a shell", "unresolved .text relocations", "all its descendants"}},
 		{"cyclic", []string{"first exact match", "shorter than 4 bytes may be nonunique"}},
-		{"sym", []string{"scope, proof and metadata source", "kernel-vma-build-id-metadata", "does not prove the same backing file", "partial errors"}},
+		{"sym", []string{"scope and metadata are verified", "kernel-vma-build-id-metadata", "does not prove the same backing file", "partial errors"}},
 		{"disass func", []string{"[--module EXACT]", "verified loaded symbol scope", "independently limits the function-extent source", "No automatic cross-module fallback"}},
-		{"VIS", []string{"explicit START END", "No automatic heap"}},
+		{"VIS", []string{"START END", "With no arguments"}},
 		{"CHUNK", []string{"--layout glibc-amd64", "No allocator"}},
 		{"!", []string{"entire remainder", "remain literal", "owned shell process group", "Only TTY stdin", "Non-TTY", "<FILE", "NO_NEW_PRIVS restriction is added", "ownership is retained", "incomplete cleanup is not reported as success"}},
 	} {

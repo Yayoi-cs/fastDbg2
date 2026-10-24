@@ -336,7 +336,7 @@ func TestUnwindBridgeFrameFactsAndReturnPCConvention(t *testing.T) {
 	seed.location.InstructionPC = result.Frames[0].PC
 	seed.location.Breakpoint = &result.Frames[0].PC
 	text := controller.backtraceText(seed, result)
-	for _, want := range []string{"[trace]", "Thread 7 (tid 1234)", "[*#0] 0x0000000000401000", "Raw RIP: 0x0000000000401001", "[ #1] 0x0000000000402008", "End of stack (CFI return address undefined)."} {
+	for _, want := range []string{"[trace]", "Thread 7 (tid 1234)", "[*#0] 0x0000000000401000", "[ #1] 0x0000000000402008"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q: %q", want, text)
 		}
@@ -359,7 +359,7 @@ func TestUnwindTextDoesNotInventUnknownCFAOrBottom(t *testing.T) {
 	if !strings.Contains(text, "Unwind incomplete: caller information unavailable.") || strings.Contains(text, "End of stack") || strings.Contains(text, "0x0000000000000000") {
 		t.Fatalf("invented CFA or bottom: %q", text)
 	}
-	frameText := controller.stackFrameText(unwindCommandSeed{}, result.Frames[0], 0)
+	frameText := controller.stackFrameText(unwindCommandSeed{abiExplicit: true}, result.Frames[0], 0)
 	if !strings.Contains(frameText, "CFA: <unavailable>") || strings.Contains(frameText, "($rax") || strings.Contains(frameText, "0x0000000000000000") {
 		t.Fatalf("invented recovery facts: %q", frameText)
 	}
@@ -385,7 +385,7 @@ func TestUnwindBridgeStrictCFIDoesNotInventCallerStackPointer(t *testing.T) {
 		}
 	}
 	controller, _, _ := newInspectionTestController()
-	text := controller.stackFrameText(unwindCommandSeed{}, result.Frames[0], 0)
+	text := controller.stackFrameText(unwindCommandSeed{abiExplicit: true}, result.Frames[0], 0)
 	if !strings.Contains(text, "ABI: strict-cfi") || strings.Contains(text, "SysV") {
 		t.Fatalf("ABI defaults leaked into strict frame: %q", text)
 	}
@@ -483,7 +483,7 @@ func TestUnwindCommandsNativeOptimizedRecursion(t *testing.T) {
 				t.Fatalf("optimized recursion: seed=%+v frames=%+v error=%v", seed.location, result, err)
 			}
 			output.Reset()
-			if err := controller.showBacktrace(ctx, "--abi sysv"); err != nil || !strings.Contains(output.String(), "End of stack (CFI return address undefined).") ||
+			if err := controller.showBacktrace(ctx, "--abi sysv"); err != nil || strings.Contains(output.String(), "Unwind incomplete") ||
 				!strings.Contains(output.String(), "[ #1]") || !unwindUIAllCFAKnown(result) {
 				t.Fatalf("backtrace: error=%v\n%s", err, output.String())
 			}
@@ -503,7 +503,7 @@ func TestUnwindCommandsNativeOptimizedRecursion(t *testing.T) {
 				t.Fatalf("unknown frame: error=%v\n%s", err, output.String())
 			}
 			output.Reset()
-			if err := controller.showBacktrace(ctx, "--abi strict"); !errors.Is(err, target.ErrUnavailable) || !strings.Contains(output.String(), "ABI: strict-cfi") || strings.Contains(output.String(), "End of stack (CFI return address undefined).") {
+			if err := controller.showBacktrace(ctx, "--abi strict"); !errors.Is(err, target.ErrUnavailable) || !strings.Contains(output.String(), "ABI: strict-cfi") || !strings.Contains(output.String(), "Unwind incomplete") {
 				t.Fatalf("strict backtrace inferred ABI rules: error=%v\n%s", err, output.String())
 			}
 			output.Reset()
@@ -576,7 +576,7 @@ func TestUnwindCommandsNativeGoStrictDebugFrame(t *testing.T) {
 		}
 	}
 	output.Reset()
-	if err := controller.showBacktrace(ctx, "--abi strict"); !errors.Is(err, target.ErrUnavailable) || !strings.Contains(output.String(), "ABI: strict-cfi") || strings.Contains(output.String(), "End of stack (CFI return address undefined).") {
+	if err := controller.showBacktrace(ctx, "--abi strict"); !errors.Is(err, target.ErrUnavailable) || !strings.Contains(output.String(), "ABI: strict-cfi") || !strings.Contains(output.String(), "Unwind incomplete") {
 		t.Fatalf("Go strict command: error=%v\n%s", err, output.String())
 	}
 	output.Reset()

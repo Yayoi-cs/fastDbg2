@@ -185,7 +185,7 @@ func TestSymbolUIHeadersAndRuntimeAddressProvenance(t *testing.T) {
 				t.Fatal(err)
 			}
 			plain := inspectionUISGR.ReplaceAllString(output, "")
-			if strings.ContainsAny(plain, "\x1b\a") || metadataJoinedField(plain, "File") != strconv.QuoteToGraphic(path) || metadataJoinedField(plain, "Source proof") != `"proc-exe+auxv"` || !strings.Contains(plain, "4 symbol(s)") {
+			if strings.ContainsAny(plain, "\x1b\a") || metadataJoinedField(plain, "File") != strconv.QuoteToGraphic(path) || metadataJoinedField(plain, "Source proof") != "" || !strings.Contains(plain, "4 symbol(s)") {
 				t.Fatalf("header facts lost/unsafe: %q", plain)
 			}
 			rows := 0
@@ -196,10 +196,10 @@ func TestSymbolUIHeadersAndRuntimeAddressProvenance(t *testing.T) {
 					if strings.Contains(visible, longName) && display.VisibleWidth(visible) <= width {
 						t.Fatal("long symbol row was prewrapped or truncated")
 					}
-					if strings.Contains(visible, `"constant"`) && (strings.Contains(line, "\x1b[31m0x") || !strings.Contains(visible, "absolute scalar")) {
+					if strings.Contains(visible, `"constant"`) && (strings.Contains(line, "\x1b[35m0x") || !strings.Contains(visible, "absolute scalar")) {
 						t.Fatalf("SHN_ABS was colored as runtime code: %q", line)
 					}
-					if color && strings.Contains(visible, `"ordinary"`) && (!strings.Contains(line, "\x1b[31m0x0000000000401000") || !strings.Contains(line, "\x1b[36m\"ordinary\"")) {
+					if color && strings.Contains(visible, `"ordinary"`) && (!strings.Contains(line, "\x1b[35m0x0000000000401000") || !strings.Contains(line, "\x1b[32m\"ordinary\"")) {
 						t.Fatalf("typed symbol colors missing: %q", line)
 					}
 					continue
@@ -222,7 +222,7 @@ func TestSymbolUIFilterOmitsOnlyHealthyNoMatchModules(t *testing.T) {
 	facts = append(facts, moduleSymbolFacts{id: "unknown", path: "/unknown/path", err: target.ErrUnavailable})
 	err := controller.renderSymbolFacts(facts, "work")
 	plain := output.String()
-	if !errors.Is(err, target.ErrUnavailable) || strings.Contains(plain, "/healthy/path") || !strings.Contains(plain, "/unknown/path") || !strings.Contains(plain, "unavailable:") || !strings.Contains(plain, "1 symbol(s)") || !strings.Contains(plain, "3 module record(s); 1 healthy no-match module(s) hidden; 1") {
+	if !errors.Is(err, target.ErrUnavailable) || strings.Contains(plain, "/healthy/path") || !strings.Contains(plain, "/unknown/path") || !strings.Contains(plain, "unavailable:") || !strings.Contains(plain, "1 symbol(s)") || strings.Contains(plain, "healthy no-match module") {
 		t.Fatalf("filter hid unknown scope or retained empty module walls: %q %v", plain, err)
 	}
 	output.Reset()
@@ -249,7 +249,7 @@ func TestDisassemblyUIFitsOrdinaryInstructionsAndKeepsBytes(t *testing.T) {
 		if err != nil || len(fixture.codeCalls) != 1 || fixture.codeCalls[0] != (contextMemoryCall{fixture.snapshot.Memory, 0x401000, 60}) || len(fixture.stackCalls) != 0 {
 			t.Fatalf("disassembly renderer changed reads: %v %+v", err, fixture.codeCalls)
 		}
-		for _, want := range []string{"55      push rbp", "4889e5  mov rbp, rsp", "90      nop", "c3      ret", "raw-pc=0x0000000000401001 instruction-pc=0x0000000000401000"} {
+		for _, want := range []string{"55      push rbp", "4889e5  mov rbp, rsp", "90      nop", "c3      ret"} {
 			if !strings.Contains(output, want) {
 				t.Fatalf("instruction facts lost %q: %s", want, output)
 			}
@@ -259,7 +259,7 @@ func TestDisassemblyUIFitsOrdinaryInstructionsAndKeepsBytes(t *testing.T) {
 				t.Fatalf("ordinary instruction still overflows: %q", line)
 			}
 		}
-		if strings.Count(output, "\n") != 6 {
+		if strings.Count(output, "\n") != 5 {
 			t.Fatalf("ordinary instructions wrapped unnecessarily: %s", output)
 		}
 	}
@@ -279,7 +279,7 @@ func TestFunctionDisassemblyUIKeepsDeclaredExtentAndEscapedHeader(t *testing.T) 
 		if err != nil || len(fixture.codeCalls) != 1 || fixture.codeCalls[0] != (contextMemoryCall{fixture.snapshot.Memory, symbol.Address, 6}) || len(fixture.stackCalls) != 0 {
 			t.Fatalf("function renderer changed extent/read: %v %+v", err, fixture.codeCalls)
 		}
-		if metadataJoinedField(output, "Function") != strconv.QuoteToGraphic(symbol.Name) || metadataJoinedField(output, "Module") != strconv.QuoteToGraphic(symbol.ModuleID) || metadataJoinedField(output, "Address") != fmt.Sprintf("0x%016x", symbol.Address) || metadataJoinedField(output, "Extent") != "6 bytes (ELF STT_FUNC extent)" {
+		if metadataJoinedField(output, "Function") != strconv.QuoteToGraphic(symbol.Name) || metadataJoinedField(output, "Module") != strconv.QuoteToGraphic(symbol.ModuleID) || metadataJoinedField(output, "Address") != fmt.Sprintf("0x%016x", symbol.Address) || metadataJoinedField(output, "Extent") != "6 bytes" {
 			t.Fatalf("function metadata lost: %s", output)
 		}
 		if strings.ContainsAny(output, "\x1b\a") || strings.Count(output, "  ret\n") != 1 || !strings.Contains(output, "4889e5  mov rbp, rsp") {

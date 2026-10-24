@@ -94,6 +94,9 @@ func (c *Controller) loadStoppedSymbolDisplayScope(ctx context.Context, snapshot
 }
 
 func (c *Controller) loadStoppedSymbolScopeWithDebug(ctx context.Context, snapshot target.Snapshot, thread target.ThreadInfo, debug bool) (*stoppedSymbolScope, error) {
+	if _, ok := c.session.(*qemuSession); ok {
+		return c.kernelScope(ctx, snapshot, thread)
+	}
 	scope := &stoppedSymbolScope{}
 	err := c.withELFModules(ctx, snapshot, thread, elfModuleSelection{All: true}, func(modules []*mappedELF) error {
 		for _, module := range modules {

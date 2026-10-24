@@ -237,7 +237,14 @@ func TestCommandIntegrationAMD64DebugFlow(t *testing.T) {
 			if !regexp.MustCompile(`(?m)^Thread #[1-9][0-9]* \(TID [1-9][0-9]*\) "(?:[^"\\]|\\.)*" — stopped: breakpoint$`).MatchString(output) {
 				t.Fatalf("compact context omitted selected thread and reason:\n%s", output)
 			}
-			location := regexp.MustCompile(`(?m)^  breakpoint instruction 0x([0-9a-f]{16}); raw \$rip = 0x([0-9a-f]{16})$`).FindStringSubmatch(output)
+			marker := regexp.MustCompile(`(?m)^\*-> 0x([0-9a-f]{16})`).FindStringSubmatchIndex(output)
+			var location []string
+			if len(marker) == 4 {
+				registers := regexp.MustCompile(`(?m)^\$rip\s*: 0x([0-9a-f]{16})`).FindAllStringSubmatch(output[:marker[0]], -1)
+				if len(registers) != 0 {
+					location = []string{"", output[marker[2]:marker[3]], registers[len(registers)-1][1]}
+				}
+			}
 			stopped := commandIntegrationStopPattern("breakpoint").FindStringSubmatch(output)
 			if len(location) != 3 || len(stopped) != 2 {
 				t.Fatalf("breakpoint context lacks raw and instruction addresses:\n%s", output)
@@ -472,7 +479,7 @@ func TestCommandIntegrationSignalDeliveryRequiresDecision(t *testing.T) {
 	}
 }
 
-func TestCommandIntegrationRejectsNonAMD64BeforeLaunch(t *testing.T) {
+func TestCommandIntegrationLaunchesX86(t *testing.T) {
 	dir := commandIntegrationDirectory(t)
 	path := filepath.Join(dir, "fixture-x86")
 	source := path + ".s"
@@ -491,8 +498,8 @@ func TestCommandIntegrationRejectsNonAMD64BeforeLaunch(t *testing.T) {
 	before := commandIntegrationChildren(t)
 	var output bytes.Buffer
 	err := runCLIInput([]string{"-f", path}, strings.NewReader("run\nquit\n"), &output)
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "amd64") {
-		t.Fatalf("non-AMD64 startup was not rejected: %v\n%s", err, output.String())
+	if err != nil || !strings.Contains(output.String(), "native x86") || !strings.Contains(output.String(), "code 47") {
+		t.Fatalf("x86 startup/exit failed: %v\n%s", err, output.String())
 	}
 	if after := commandIntegrationChildren(t); !reflect.DeepEqual(before, after) {
 		t.Fatalf("unsupported startup changed child set: before=%v after=%v", before, after)

@@ -138,7 +138,7 @@ func TestArenaExplicitLayoutUsesOneSnapshotAndDerivedFields(t *testing.T) {
 	if err := controller.showArenas(context.Background(), fmt.Sprintf("--layout-file %q 0x1000", path)); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"[arena]", "user-selected", "arena[0] 0x0000000000001000", "+0x48 attached_threads", "0x0000000000000003", "observed-arenas=1 requested-bytes=96", "thread ownership are not inferred"} {
+	for _, want := range []string{"[arena]", "arena[0] 0x0000000000001000", "+0x48 attached_threads", "0x0000000000000003", "observed-arenas=1 requested-bytes=96"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing %q output=%q", want, output.String())
 		}

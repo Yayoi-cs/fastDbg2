@@ -224,7 +224,11 @@ func (c *Controller) showAssembly(ctx context.Context, rawArgs string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: asm \"INTEL_ASSEMBLY\" | INSTRUCTION: %w", target.ErrInvalidArgument)
 	}
-	data, err := assembleAMD64(ctx, args[0])
+	arch, err := c.assemblyArchitecture()
+	if err != nil {
+		return err
+	}
+	data, err := assembleNative(ctx, args[0], arch)
 	if err != nil {
 		return err
 	}
@@ -234,11 +238,13 @@ func (c *Controller) showAssembly(ctx context.Context, rawArgs string) error {
 	if err := c.writef("%d bytes: %x\n", len(data), data); err != nil {
 		return err
 	}
+	view := *c
+	view.arch = arch
 	for offset := 0; offset < len(data); offset += 16 {
 		if err := contextReady(ctx); err != nil {
 			return err
 		}
-		if err := c.hexRows(target.Address(offset), data[offset:min(offset+16, len(data))], 1); err != nil {
+		if err := view.hexRows(target.Address(offset), data[offset:min(offset+16, len(data))], 1); err != nil {
 			return err
 		}
 	}
@@ -312,7 +318,11 @@ func (output *assemblyDiagnostics) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func assembleAMD64(ctx context.Context, source string) (data []byte, err error) {
+func assembleAMD64(ctx context.Context, source string) ([]byte, error) {
+	return assembleNative(ctx, source, target.AMD64)
+}
+
+func assembleNative(ctx context.Context, source string, arch target.Architecture) (data []byte, err error) {
 	if err := contextReady(ctx); err != nil {
 		return nil, err
 	}
@@ -321,7 +331,7 @@ func assembleAMD64(ctx context.Context, source string) (data []byte, err error) 
 	}
 	assembler, err := exec.LookPath("as")
 	if err != nil {
-		return nil, fmt.Errorf("GNU as is required for AMD64 assembly: %w: %w", target.ErrUnavailable, err)
+		return nil, fmt.Errorf("GNU as is required for x86/amd64 assembly: %w: %w", target.ErrUnavailable, err)
 	}
 	assembler, err = filepath.Abs(assembler)
 	if err != nil {
@@ -371,7 +381,7 @@ func assembleAMD64(ctx context.Context, source string) (data []byte, err error) 
 	diagnostic := &assemblyDiagnostics{}
 	command := shellcmd.Command{
 		Path:       assembler,
-		Args:       []string{"--64", "--fatal-warnings", "-o", "/proc/self/fd/3", "-"},
+		Args:       []string{fmt.Sprintf("--%d", abiFor(arch).bits), "--fatal-warnings", "-o", "/proc/self/fd/3", "-"},
 		Dir:        directory,
 		Env:        environment,
 		Stdin:      input,
@@ -392,7 +402,7 @@ func assembleAMD64(ctx context.Context, source string) (data []byte, err error) 
 	if err := contextReady(ctx); err != nil {
 		return nil, err
 	}
-	data, err = readAssemblyObject(object)
+	data, err = readAssemblyObjectFor(object, arch)
 	if cancelErr := contextReady(ctx); cancelErr != nil {
 		return nil, errors.Join(err, cancelErr)
 	}
@@ -400,11 +410,16 @@ func assembleAMD64(ctx context.Context, source string) (data []byte, err error) 
 }
 
 func readAssemblyObject(reader io.ReaderAt) ([]byte, error) {
+	return readAssemblyObjectFor(reader, target.AMD64)
+}
+
+func readAssemblyObjectFor(reader io.ReaderAt, arch target.Architecture) ([]byte, error) {
 	file, err := elf.NewFile(reader)
 	if err != nil {
 		return nil, fmt.Errorf("assembler object: %w", err)
 	}
-	if file.Class != elf.ELFCLASS64 || file.Data != elf.ELFDATA2LSB || file.Machine != elf.EM_X86_64 || file.Type != elf.ET_REL {
+	actual, archErr := nativeELFArchitecture(file)
+	if archErr != nil || actual != arch || file.Type != elf.ET_REL {
 		return nil, fmt.Errorf("assembler must emit an ELF64 little-endian AMD64 relocatable object: %w", target.ErrUnsupported)
 	}
 	var text *elf.Section

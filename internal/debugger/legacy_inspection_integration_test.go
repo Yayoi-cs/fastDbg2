@@ -95,13 +95,13 @@ func TestLegacyInspectionNativeExactELFFunctions(t *testing.T) {
 				}
 			}
 			output.Reset()
-			if err := controller.showSymbols(ctx, "legacy_bounded"); err != nil || !strings.Contains(output.String(), `"legacy_bounded"`) || !strings.Contains(output.String(), "1 symbol(s)") || metadataJoinedField(output.String(), "Source proof") != `"proc-exe+auxv"` {
+			if err := controller.showSymbols(ctx, "legacy_bounded"); err != nil || !strings.Contains(output.String(), `"legacy_bounded"`) || !strings.Contains(output.String(), "1 symbol(s)") || metadataJoinedField(output.String(), "Source proof") != "" {
 				t.Fatalf("symbols: error=%v output=%q", err, output.String())
 			}
 			for _, args := range []string{"func legacy_bounded", "f", "FUNC $rip", "func --module main legacy_bounded", "func --module main"} {
 				output.Reset()
 				if err := controller.showDisassemble(ctx, args); err != nil || strings.Count(output.String(), "  nop\n") != 2 || strings.Count(output.String(), "  ret\n") != 2 ||
-					metadataJoinedField(output.String(), "Extent") != "4 bytes (ELF STT_FUNC extent)" || strings.Contains(output.String(), "int3") {
+					metadataJoinedField(output.String(), "Extent") != "4 bytes" || strings.Contains(output.String(), "int3") {
 					t.Fatalf("disassemble %s: error=%v output=%q", args, err, output.String())
 				}
 			}

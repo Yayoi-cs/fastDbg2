@@ -108,8 +108,8 @@ func ParseHeapLayout(data []byte) (HeapLayout, error) {
 }
 
 func (layout HeapLayout) Validate() error {
-	if layout.Schema != 1 || layout.Allocator != "glibc" || layout.Arch != "amd64" || layout.Endian != "little" || layout.Pointer != 8 {
-		return heapLayoutError("requires schema 1, glibc, amd64, little endian, and 8-byte pointers")
+	if layout.Schema != 1 || layout.Allocator != "glibc" || (layout.Arch != "amd64" || layout.Pointer != 8) && (layout.Arch != "x86" || layout.Pointer != 4) || layout.Endian != "little" {
+		return heapLayoutError("requires schema 1, glibc, little endian, and amd64/8-byte or x86/4-byte pointers")
 	}
 	_, hasFastbins := layout.Arena.Fields["fastbinsY"]
 	if (hasFastbins || layout.FastLink != "") && layout.FastLink != "plain" && layout.FastLink != "safe-link-12" {
@@ -119,7 +119,7 @@ func (layout HeapLayout) Validate() error {
 		name   string
 		record HeapRecord
 	}{{"arena", layout.Arena}, {"chunk", layout.Chunk}} {
-		if err := heapValidateRecord(item.name, item.record); err != nil {
+		if err := heapValidateRecord(item.name, item.record, layout.Pointer); err != nil {
 			return err
 		}
 	}
@@ -133,23 +133,27 @@ func (layout HeapLayout) Validate() error {
 			return heapLayoutError("chunk field %q is required", name)
 		}
 	}
-	if layout.Chunk.Fields["bk"].Offset != layout.Chunk.Fields["fd"].Offset+8 {
+	if layout.Chunk.Fields["bk"].Offset != layout.Chunk.Fields["fd"].Offset+layout.Pointer {
 		return heapLayoutError("chunk bk must immediately follow fd")
 	}
 	if layout.Tcache != nil || layout.TcacheEntry != nil || layout.TcacheLink != "" {
 		if layout.Tcache == nil || layout.TcacheEntry == nil || layout.TcacheLink != "plain" && layout.TcacheLink != "safe-link-12" {
 			return heapLayoutError("tcache and tcache_entry require an explicit plain or safe-link-12 tcache_link")
 		}
-		return heapValidateTcache(*layout.Tcache, *layout.TcacheEntry)
+		return heapValidateTcache(*layout.Tcache, *layout.TcacheEntry, layout.Pointer)
 	}
 	return nil
 }
 
-func heapValidateTcache(root, entry HeapRecord) error {
-	if err := heapValidateRecord("tcache", root); err != nil {
+func heapValidateTcache(root, entry HeapRecord, widths ...uint64) error {
+	word := uint64(8)
+	if len(widths) > 0 {
+		word = widths[0]
+	}
+	if err := heapValidateRecord("tcache", root, word); err != nil {
 		return err
 	}
-	if err := heapValidateRecord("tcache_entry", entry); err != nil {
+	if err := heapValidateRecord("tcache_entry", entry, word); err != nil {
 		return err
 	}
 	entries, exists := root.Fields["entries"]
@@ -218,7 +222,11 @@ func heapFieldKind(record, field string) (pointer, array, allowed bool) {
 	return false, false, false
 }
 
-func heapValidateRecord(name string, record HeapRecord) error {
+func heapValidateRecord(name string, record HeapRecord, widths ...uint64) error {
+	word := uint64(8)
+	if len(widths) > 0 {
+		word = widths[0]
+	}
 	if err := heapValidateRecordBounds(name, record); err != nil {
 		return err
 	}
@@ -228,13 +236,13 @@ func heapValidateRecord(name string, record HeapRecord) error {
 		if !allowed {
 			return heapLayoutError("unknown %s field %q", name, fieldName)
 		}
-		if pointer && field.Width != 8 || !array && field.Count != 1 {
+		if pointer && field.Width != word || !array && field.Count != 1 {
 			return heapLayoutError("%s.%s has invalid pointer width or scalar count", name, fieldName)
 		}
 		if name == "arena" && (fieldName == "fastbinsY" && field.Count > 256 || fieldName == "bins" && (field.Count < 2 || field.Count%2 != 0)) {
 			return heapLayoutError("arena.%s has invalid array count", fieldName)
 		}
-		if name == "tcache_entry" && fieldName == "key" && field.Width != 8 {
+		if name == "tcache_entry" && fieldName == "key" && field.Width != word {
 			return heapLayoutError("tcache_entry.key must be 8 bytes")
 		}
 	}
@@ -378,6 +386,7 @@ func heapJSONRecord(raw json.RawMessage, name string) (HeapRecord, error) {
 }
 
 type heapDWARF struct {
+	word       uint64
 	data       *dwarf.Data
 	entries    map[dwarf.Offset]*dwarf.Entry
 	unitReader *dwarf.Reader
@@ -429,7 +438,11 @@ func HeapLayoutFromDWARF(data *dwarf.Data, arenaType dwarf.Offset, fastLink stri
 	if err != nil {
 		return HeapLayout{}, err
 	}
-	layout := HeapLayout{Schema: 1, Allocator: "glibc", Arch: "amd64", Endian: "little", Pointer: 8, Arena: arenaRecord, Chunk: chunkRecord, FastLink: fastLink}
+	arch := "amd64"
+	if parser.word == 4 {
+		arch = "x86"
+	}
+	layout := HeapLayout{Schema: 1, Allocator: "glibc", Arch: arch, Endian: "little", Pointer: parser.word, Arena: arenaRecord, Chunk: chunkRecord, FastLink: fastLink}
 	if err := layout.Validate(); err != nil {
 		return HeapLayout{}, err
 	}
@@ -461,7 +474,7 @@ func HeapTcacheLayoutFromDWARF(data *dwarf.Data, rootType dwarf.Offset) (HeapRec
 	if err != nil {
 		return HeapRecord{}, HeapRecord{}, err
 	}
-	if err := heapValidateTcache(rootRecord, entryRecord); err != nil {
+	if err := heapValidateTcache(rootRecord, entryRecord, parser.word); err != nil {
 		return HeapRecord{}, HeapRecord{}, err
 	}
 	return rootRecord, entryRecord, nil
@@ -534,9 +547,10 @@ func (parser *heapDWARF) entry(offset dwarf.Offset) (*dwarf.Entry, error) {
 	if entry == nil || entry.Offset != offset || entry.Tag == 0 {
 		return nil, heapLayoutError("missing DWARF entry at %#x", offset)
 	}
-	if reader.AddressSize() != 8 || reader.ByteOrder() != binary.LittleEndian {
-		return nil, heapLayoutError("DWARF requires little-endian 8-byte addresses")
+	if (reader.AddressSize() != 4 && reader.AddressSize() != 8) || parser.word != 0 && parser.word != uint64(reader.AddressSize()) || reader.ByteOrder() != binary.LittleEndian {
+		return nil, heapLayoutError("DWARF requires consistent little-endian 4-byte or 8-byte addresses")
 	}
+	parser.word = uint64(reader.AddressSize())
 	if err := heapDWARFAttributes(entry); err != nil {
 		return nil, err
 	}
@@ -598,9 +612,13 @@ func heapDWARFType(entry *dwarf.Entry) (dwarf.Offset, error) {
 	return 0, heapLayoutError("DWARF type reference at %#x is missing or unsupported", entry.Offset)
 }
 
-func heapDWARFSize(entry *dwarf.Entry) (uint64, error) {
+func heapDWARFSize(entry *dwarf.Entry, widths ...uint64) (uint64, error) {
+	word := uint64(8)
+	if len(widths) > 0 {
+		word = widths[0]
+	}
 	if entry.Tag == dwarf.TagPointerType && entry.AttrField(dwarf.AttrByteSize) == nil {
-		return 8, nil
+		return word, nil
 	}
 	return heapDWARFUint(entry, dwarf.AttrByteSize)
 }
@@ -623,7 +641,7 @@ func (parser *heapDWARF) unwrap(offset dwarf.Offset) (*dwarf.Entry, error) {
 				return nil, heapLayoutError("DWARF type wrapper has children at %#x", offset)
 			}
 			if entry.AttrField(dwarf.AttrByteSize) != nil {
-				size, err := heapDWARFSize(entry)
+				size, err := heapDWARFSize(entry, parser.word)
 				if err != nil {
 					return nil, err
 				}
@@ -635,7 +653,7 @@ func (parser *heapDWARF) unwrap(offset dwarf.Offset) (*dwarf.Entry, error) {
 			}
 		default:
 			if len(sizes) != 0 {
-				size, err := heapDWARFSize(entry)
+				size, err := heapDWARFSize(entry, parser.word)
 				if err != nil {
 					return nil, err
 				}
@@ -794,14 +812,14 @@ func (parser *heapDWARF) shape(offset dwarf.Offset, followPointers bool) (heapDW
 	if entry.Children {
 		return shape, heapLayoutError("DWARF field element must be a primitive type")
 	}
-	shape.width, err = heapDWARFSize(entry)
+	shape.width, err = heapDWARFSize(entry, parser.word)
 	if err != nil || shape.width != 1 && shape.width != 2 && shape.width != 4 && shape.width != 8 {
 		return shape, heapLayoutError("DWARF element width must be 1, 2, 4, or 8")
 	}
 	switch entry.Tag {
 	case dwarf.TagPointerType:
-		if shape.width != 8 || entry.AttrField(dwarf.AttrAddrClass) != nil {
-			return shape, heapLayoutError("DWARF pointers must be ordinary 8-byte pointers")
+		if shape.width != parser.word || entry.AttrField(dwarf.AttrAddrClass) != nil {
+			return shape, heapLayoutError("DWARF pointers must match the compilation-unit address size")
 		}
 		shape.pointer = true
 		if followPointers || entry.AttrField(dwarf.AttrType) != nil {

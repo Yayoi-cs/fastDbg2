@@ -95,7 +95,7 @@ func TestTelescopeOnlyReadsRawQwords(t *testing.T) {
 	if err := controller.showTelescope(context.Background(), "$rip 2"); err != nil {
 		t.Fatal(err)
 	}
-	want := controller.renderer.Section("telescope", 100) + "\n          0x0000000000401001|+0x0000|+000: 0x6867666564636261\n          0x0000000000401009|+0x0008|+001: 0x4847464544434241\n"
+	want := "          0x0000000000401001|+0x0000|+000: 0x6867666564636261\n          0x0000000000401009|+0x0008|+001: 0x4847464544434241\n"
 	if output.String() != want || len(fixture.stackCalls) != 3 || fixture.stackCalls[0] != (contextMemoryCall{fixture.snapshot.Memory, 0x401001, 8}) ||
 		fixture.stackCalls[1] != (contextMemoryCall{fixture.snapshot.Memory, 0x401009, 32}) || fixture.stackCalls[2] != (contextMemoryCall{fixture.snapshot.Memory, 0x401009, 8}) ||
 		fixture.mapCalls != 1 ||

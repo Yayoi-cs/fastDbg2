@@ -1,6 +1,7 @@
 package qemu
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -24,6 +25,7 @@ type Options struct {
 }
 
 type Session struct {
+	hardwarePoints    map[HardwarePoint]bool
 	protocol          *protocol
 	operation         chan struct{}
 	mu                sync.Mutex
@@ -39,6 +41,7 @@ type Session struct {
 	packetSize        int
 	noAck             bool
 	selected          *uint64
+	inspectionThread  *uint64
 	outputMu          sync.Mutex
 	output            []byte
 	outputLimit       int
@@ -203,6 +206,8 @@ func (s *Session) Generation() uint64 {
 }
 
 func copyStop(stop target.Stop) target.Stop {
+	stop.Watchpoints = slices.Clone(stop.Watchpoints)
+	stop.HardwareBreakpoints = slices.Clone(stop.HardwareBreakpoints)
 	if stop.ThreadID != nil {
 		value := *stop.ThreadID
 		stop.ThreadID = &value
@@ -371,6 +376,9 @@ func parseThread(value string) (uint64, error) {
 
 func (s *Session) selectThread() error {
 	tid, err := s.currentThread()
+	if s.inspectionThread != nil {
+		tid, err = *s.inspectionThread, nil
+	}
 	if err != nil {
 		return err
 	}
@@ -393,6 +401,15 @@ func (s *Session) Step(signal target.Signal) (target.Stop, error) {
 }
 
 func (s *Session) resume(step bool, signal target.Signal) (target.Stop, error) {
+	return s.resumeCPU(step, signal, nil, !step, nil)
+}
+
+func (s *Session) resumeCPU(step bool, signal target.Signal, cpu *uint64, peers bool, started chan<- error) (result target.Stop, resultErr error) {
+	defer func() {
+		if started != nil {
+			started <- resultErr
+		}
+	}()
 	if signal.Domain != target.SignalGDB && signal != (target.Signal{}) {
 		return target.Stop{}, fmt.Errorf("%w: expected GDB signal", target.ErrUnsupported)
 	}
@@ -417,13 +434,16 @@ func (s *Session) resume(step bool, signal target.Signal) (target.Stop, error) {
 	if signal.Number != 0 {
 		command += fmt.Sprintf("%02x", signal.Number)
 	}
-	if step || signal.Number != 0 {
+	if step || signal.Number != 0 || cpu != nil && !peers {
 		tid, err := s.currentThread()
+		if cpu != nil {
+			tid, err = *cpu, nil
+		}
 		if err != nil {
 			return target.Stop{}, err
 		}
 		command += fmt.Sprintf(":%x", tid)
-		if !step {
+		if peers {
 			command += ";c"
 		}
 	}
@@ -441,6 +461,10 @@ func (s *Session) resume(step bool, signal target.Signal) (target.Stop, error) {
 	s.mu.Unlock()
 	if err != nil {
 		return target.Stop{}, err
+	}
+	if started != nil {
+		started <- nil
+		started = nil
 	}
 	data, err := s.protocol.reply(s.noAck, true, s.appendOutput)
 	if err != nil {
@@ -493,6 +517,28 @@ func (s *Session) Detach() error {
 	slices.Sort(addresses)
 	for _, addr := range addresses {
 		if err := s.removeBreakpoint(addr); err != nil {
+			return err
+		}
+	}
+
+	points := make([]HardwarePoint, 0, len(s.hardwarePoints))
+	for point := range s.hardwarePoints {
+		points = append(points, point)
+	}
+	slices.SortFunc(points, func(a, b HardwarePoint) int {
+		if a.Kind != b.Kind {
+			return a.Kind - b.Kind
+		}
+		if a.Address < b.Address {
+			return -1
+		}
+		if a.Address > b.Address {
+			return 1
+		}
+		return a.Size - b.Size
+	})
+	for _, point := range points {
+		if err := s.removeHardwarePoint(point); err != nil {
 			return err
 		}
 	}
@@ -575,7 +621,22 @@ func (s *Session) parseStop(data []byte) (target.Stop, error) {
 				}
 				reasons++
 				stop.Reason = target.StopBreakpoint
-			case "watch", "rwatch", "awatch", "syscall_entry", "syscall_return", "library", "replaylog", "fork", "vfork", "vforkdone", "exec", "clone", "create":
+				if key == "hwbreak" {
+					stop.Reason = target.StopHardwareBreakpoint
+				}
+			case "watch", "rwatch", "awatch":
+				address, err := strconv.ParseUint(value, 16, 64)
+				if err != nil || number != 5 {
+					return stop, fmt.Errorf("%w: invalid watchpoint stop", ErrProtocol)
+				}
+				reasons++
+				stop.Reason = target.StopWatchpoint
+				access := target.WatchReadWrite
+				if key == "watch" {
+					access = target.WatchWrite
+				}
+				stop.Watchpoints = []target.WatchpointHit{{Address: target.Address(address), Access: access}}
+			case "syscall_entry", "syscall_return", "library", "replaylog", "fork", "vfork", "vforkdone", "exec", "clone", "create":
 				reasons++
 				stop.Reason = target.StopUnknown
 			default:
@@ -609,7 +670,7 @@ func (s *Session) parseStop(data []byte) (target.Stop, error) {
 		if reasons > 1 {
 			return stop, fmt.Errorf("%w: multiple stop reasons", ErrProtocol)
 		}
-		if stop.Reason == target.StopBreakpoint && stop.RawPC != nil {
+		if (stop.Reason == target.StopBreakpoint || stop.Reason == target.StopHardwareBreakpoint) && stop.RawPC != nil {
 			pc := *stop.RawPC
 			stop.Breakpoint = &pc
 		}
@@ -617,4 +678,38 @@ func (s *Session) parseStop(data []byte) (target.Stop, error) {
 		return stop, fmt.Errorf("%w: stop reply %q", target.ErrUnsupported, data[0])
 	}
 	return stop, nil
+}
+
+type Execution struct {
+	done chan struct{}
+	stop target.Stop
+	err  error
+}
+
+func (op *Execution) Wait(ctx context.Context) (target.Stop, error) {
+	select {
+	case <-op.done:
+		return copyStop(op.stop), op.err
+	default:
+	}
+	select {
+	case <-op.done:
+		return copyStop(op.stop), op.err
+	case <-ctx.Done():
+		return target.Stop{}, ctx.Err()
+	}
+}
+
+func (s *Session) StartCPU(cpu uint64, step, peers bool) (*Execution, error) {
+	if cpu == 0 {
+		return nil, target.ErrInvalidArgument
+	}
+	op := &Execution{done: make(chan struct{})}
+	started := make(chan error, 1)
+	go func() { op.stop, op.err = s.resumeCPU(step, target.Signal{}, &cpu, peers, started); close(op.done) }()
+	if err := <-started; err != nil {
+		<-op.done
+		return nil, err
+	}
+	return op, nil
 }

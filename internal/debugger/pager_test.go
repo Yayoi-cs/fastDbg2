@@ -344,7 +344,7 @@ func TestPagerRawOutputAndAddressWalkFatality(t *testing.T) {
 	}
 	var expected bytes.Buffer
 	plain := &Controller{out: &expected}
-	plain.publishAddressWalk(context.Background(), "telescope", "confirmed prefix\n", io.ErrUnexpectedEOF)
+	plain.publishPagedAddressWalk(context.Background(), "telescope", "confirmed prefix\n", io.ErrUnexpectedEOF)
 	if expected.String() != output.String() {
 		t.Fatalf("pager raw formatting changed: output=%q want=%q", output.String(), expected.String())
 	}
@@ -360,7 +360,7 @@ func TestPagerTelescopePreservesLogicalRowsAndLegacyDefault(t *testing.T) {
 	controller, fixture, output := newAddressWalkTestController()
 	fixture.stack = make([]byte, 128*8)
 	quit, err := controller.Execute(context.Background(), "tel", "$rsp")
-	if err != nil || quit || len(fixture.stackCalls) != 128 || strings.Count(output.String(), "\n") != 129 || !strings.Contains(output.String(), "|+0x03f8|+127:") {
+	if err != nil || quit || len(fixture.stackCalls) != 128 || strings.Count(output.String(), "\n") != 128 || !strings.Contains(output.String(), "|+0x03f8|+127:") {
 		t.Fatalf("legacy default: quit=%t error=%v reads=%d output=%q", quit, err, len(fixture.stackCalls), output.String())
 	}
 	for _, call := range fixture.stackCalls {
@@ -376,12 +376,12 @@ func TestPagerTelescopePreservesLogicalRowsAndLegacyDefault(t *testing.T) {
 	addressWalkTestWords(fixture, words)
 	quit, err = controller.Execute(context.Background(), "telescope", "--depth 16 0x1000 1")
 	rows := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
-	if err != nil || quit || len(fixture.stackCalls) != 17 || len(rows) != 2 || display.VisibleWidth(rows[1]) <= 120 || strings.Count(rows[1], " -> ") != 17 || !strings.HasSuffix(rows[1], "0x0000000000001088 -> ...") {
+	if err != nil || quit || len(fixture.stackCalls) != 17 || len(rows) != 1 || display.VisibleWidth(rows[0]) <= 120 || strings.Count(rows[0], " -> ") != 17 || !strings.HasSuffix(rows[0], "0x0000000000001088 -> ...") {
 		t.Fatalf("logical chain was wrapped or shortened: quit=%t error=%v reads=%d rows=%q", quit, err, len(fixture.stackCalls), rows)
 	}
 	var ordinary bytes.Buffer
 	controller.out = &ordinary
-	if err := controller.publishAddressWalk(context.Background(), "stack", rows[1]+"\n", nil); err != nil || strings.Count(ordinary.String(), "\n") <= 2 {
+	if err := controller.publishAddressWalk(context.Background(), "stack", rows[0]+"\n", nil); err != nil || strings.Count(ordinary.String(), "\n") <= 2 {
 		t.Fatalf("nonpager stack wrapping changed: error=%v text=%q", err, ordinary.String())
 	}
 }

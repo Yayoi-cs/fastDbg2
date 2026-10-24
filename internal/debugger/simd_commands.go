@@ -18,6 +18,8 @@ type extendedRegisterReader interface {
 }
 
 type simdState struct {
+	arch         target.Architecture
+	fcs, fds     uint16
 	format       target.ExtendedRegisterFormat
 	features     uint64
 	present      uint64
@@ -59,8 +61,9 @@ func simdArguments(name, rawArgs string) (int, error) {
 
 func decodeSIMDState(state target.ExtendedRegisterState) (simdState, error) {
 	var result simdState
-	if state.Architecture != target.AMD64 {
-		return result, fmt.Errorf("SIMD display requires amd64, got %q: %w", state.Architecture, target.ErrUnsupported)
+	result.arch = state.Architecture
+	if state.Architecture != target.AMD64 && state.Architecture != target.X86 {
+		return result, fmt.Errorf("SIMD display requires x86 or amd64, got %q: %w", state.Architecture, target.ErrUnsupported)
 	}
 	data := state.Data
 	result.format = state.Format
@@ -131,17 +134,23 @@ func decodeSIMDState(state target.ExtendedRegisterState) (simdState, error) {
 		result.fop = binary.LittleEndian.Uint16(data[6:8]) & 0x7ff
 		result.fip = binary.LittleEndian.Uint64(data[8:16])
 		result.fdp = binary.LittleEndian.Uint64(data[16:24])
+		if state.Architecture == target.X86 {
+			result.fip = uint64(binary.LittleEndian.Uint32(data[8:12]))
+			result.fdp = uint64(binary.LittleEndian.Uint32(data[16:20]))
+			result.fcs = binary.LittleEndian.Uint16(data[12:14])
+			result.fds = binary.LittleEndian.Uint16(data[20:22])
+		}
 		for index := range result.x87 {
 			copy(result.x87[index][:], data[32+16*index:42+16*index])
 		}
 	}
 	if result.present&2 != 0 {
-		for index := range result.xmm {
+		for index := range result.xmm[:result.vectorCount()] {
 			copy(result.xmm[index][:], data[160+16*index:176+16*index])
 		}
 	}
 	if result.present&4 != 0 {
-		for index := range result.ymmHigh {
+		for index := range result.ymmHigh[:result.vectorCount()] {
 			offset := uint64(ymmOffset) + uint64(index)*16
 			copy(result.ymmHigh[index][:], data[offset:offset+16])
 		}
@@ -157,9 +166,12 @@ func (c *Controller) showSIMD(ctx context.Context, name, rawArgs string) error {
 	if err != nil {
 		return err
 	}
-	_, thread, err := c.stopped()
+	snapshot, thread, err := c.stopped()
 	if err != nil {
 		return err
+	}
+	if _, ok := c.session.(*qemuSession); ok {
+		return c.showQemuSIMD(ctx, name, index, thread)
 	}
 	reader, ok := c.session.(extendedRegisterReader)
 	if !ok {
@@ -175,12 +187,18 @@ func (c *Controller) showSIMD(ctx context.Context, name, rawArgs string) error {
 	if err != nil {
 		return err
 	}
-	if state.Token != thread.Token {
+	if state.Architecture != target.AMD64 && state.Architecture != target.X86 {
+		return target.ErrUnsupported
+	}
+	if state.Token != thread.Token || state.Architecture != snapshot.Architecture {
 		return fmt.Errorf("extended register token differs from selected thread: %w", target.ErrStale)
 	}
 	registers, err := decodeSIMDState(state)
 	if err != nil {
 		return err
+	}
+	if index >= registers.vectorCount() {
+		return fmt.Errorf("%s index must be below %d for %s: %w", name, registers.vectorCount(), state.Architecture, target.ErrInvalidArgument)
 	}
 	if index >= 0 {
 		if name == "xmm" {
@@ -272,9 +290,6 @@ func (c *Controller) writeSIMD(ctx context.Context, state simdState) error {
 	if err := view.heading("SIMD"); err != nil {
 		return err
 	}
-	if err := writef("format=%s\n", state.format); err != nil {
-		return err
-	}
 	if state.xmmAvailable {
 		var flags []string
 		for index, flag := range [...]string{"IE", "DE", "ZE", "OE", "UE", "PE"} {
@@ -282,7 +297,7 @@ func (c *Controller) writeSIMD(ctx context.Context, state simdState) error {
 				flags = append(flags, flag)
 			}
 		}
-		value := fmt.Sprintf("0x%08x", state.mxcsr)
+		value := c.renderer.Text(display.StyleCyan, fmt.Sprintf("0x%08x", state.mxcsr))
 		if err := writef("MXCSR: %s [%s] RC:%d FTZ:%d DAZ:%d\nMXCSR_MASK: 0x%08x\n", value, strings.Join(flags, " "),
 			(state.mxcsr>>13)&3, (state.mxcsr>>15)&1, (state.mxcsr>>6)&1, state.mxcsrMask); err != nil {
 			return err
@@ -306,7 +321,7 @@ func (c *Controller) writeSIMD(ctx context.Context, state simdState) error {
 				return err
 			}
 		}
-		for index := range state.xmm {
+		for index := range state.xmm[:state.vectorCount()] {
 			if err := c.writeXMMWidth(ctx, index, state.xmm[index][:], width); err != nil {
 				return err
 			}
@@ -323,7 +338,7 @@ func (c *Controller) writeSIMD(ctx context.Context, state simdState) error {
 				return err
 			}
 		}
-		for index := range state.ymmHigh {
+		for index := range state.ymmHigh[:state.vectorCount()] {
 			if err := c.writeYMMWidth(ctx, index, state.xmm[index][:], state.ymmHigh[index][:], width); err != nil {
 				return err
 			}
@@ -339,9 +354,14 @@ func (c *Controller) writeSIMD(ctx context.Context, state simdState) error {
 			return err
 		}
 	}
-	if err := writef("FCW: 0x%04x  FSW: 0x%04x  FTW (abridged): 0x%02x  FOP: 0x%04x\nFIP: 0x%016x  FDP: 0x%016x\n",
-		state.fcw, state.fsw, state.ftw, state.fop, state.fip, state.fdp); err != nil {
+	if err := writef("FCW: 0x%04x  FSW: 0x%04x  FTW (abridged): 0x%02x  FOP: 0x%04x\nFIP: 0x%0*x  FDP: 0x%0*x\n",
+		state.fcw, state.fsw, state.ftw, state.fop, abiFor(state.arch).word*2, state.fip, abiFor(state.arch).word*2, state.fdp); err != nil {
 		return err
+	}
+	if state.arch == target.X86 {
+		if err := writef("FCS: 0x%04x  FDS: 0x%04x\n", state.fcs, state.fds); err != nil {
+			return err
+		}
 	}
 	for index, data := range state.x87 {
 		if err := contextReady(ctx); err != nil {
@@ -352,4 +372,11 @@ func (c *Controller) writeSIMD(ctx context.Context, state simdState) error {
 		}
 	}
 	return nil
+}
+
+func (state simdState) vectorCount() int {
+	if state.arch == target.X86 {
+		return 8
+	}
+	return 16
 }

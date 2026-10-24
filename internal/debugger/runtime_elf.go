@@ -37,6 +37,7 @@ type runtimeELFLink struct {
 }
 
 type runtimeELFModule struct {
+	Architecture     target.Architecture
 	ID               string
 	Name             string
 	Proof            string
@@ -234,6 +235,9 @@ func (c *Controller) runtimeELFModulesWithMain(ctx context.Context, snapshot tar
 	if err := contextReady(ctx); err != nil {
 		return nil, err
 	}
+	if snapshot.Architecture == target.X86 && snapshot.State == target.StateStopped {
+		return c.runtimeX86Modules(ctx, snapshot, proc, main)
+	}
 	if snapshot.Architecture != target.AMD64 || snapshot.State != target.StateStopped {
 		return nil, target.ErrUnsupported
 	}
@@ -259,15 +263,22 @@ func (c *Controller) runtimeELFModulesWithMain(ctx context.Context, snapshot tar
 	return view, err
 }
 
-func runtimeAuxiliary(data []byte) (map[uint64]uint64, error) {
-	if len(data) == 0 || len(data)%16 != 0 {
+func runtimeAuxiliary(data []byte, widths ...int) (map[uint64]uint64, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
+	if word != 4 && word != 8 {
+		return nil, target.ErrInvalidArgument
+	}
+	if len(data) == 0 || len(data)%(word*2) != 0 {
 		return nil, target.ErrInvalidArgument
 	}
 	values := make(map[uint64]uint64)
 	terminated := false
-	for offset := 0; offset < len(data); offset += 16 {
-		key := binary.LittleEndian.Uint64(data[offset:])
-		value := binary.LittleEndian.Uint64(data[offset+8:])
+	for offset := 0; offset < len(data); offset += word * 2 {
+		key := inspectionWord(data[offset : offset+word])
+		value := inspectionWord(data[offset+word : offset+2*word])
 		if terminated {
 			if key != 0 || value != 0 {
 				return nil, fmt.Errorf("nonzero data after AT_NULL: %w", target.ErrInvalidArgument)
@@ -797,7 +808,14 @@ type runtimeELFWitness struct {
 	data    []byte
 }
 
-func runtimeELFLinkMaps(memory *runtimeELFMemory, address target.Address) ([]runtimeLinkMap, error) {
+func runtimeELFLinkMaps(memory *runtimeELFMemory, address target.Address, widths ...int) ([]runtimeLinkMap, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
+	if word != 4 && word != 8 {
+		return nil, target.ErrInvalidArgument
+	}
 	if memory == nil || address == 0 {
 		return nil, target.ErrInvalidArgument
 	}
@@ -813,7 +831,7 @@ func runtimeELFLinkMaps(memory *runtimeELFMemory, address target.Address) ([]run
 			return nil, fmt.Errorf("cyclic runtime loader namespace list: %w", target.ErrInvalidArgument)
 		}
 		namespaces[address] = true
-		debug, err := memory.bytes(address, 40)
+		debug, err := memory.bytes(address, uint64(word*5))
 		if err != nil {
 			return nil, err
 		}
@@ -821,23 +839,23 @@ func runtimeELFLinkMaps(memory *runtimeELFMemory, address target.Address) ([]run
 		if version != 1 && version != 2 {
 			return nil, fmt.Errorf("runtime rendezvous version %d: %w", version, target.ErrUnsupported)
 		}
-		if binary.LittleEndian.Uint32(debug[24:]) != 0 {
+		if binary.LittleEndian.Uint32(debug[3*word:]) != 0 {
 			return nil, fmt.Errorf("runtime loader list is not RT_CONSISTENT: %w", target.ErrUnavailable)
 		}
 		var nextNamespace target.Address
 		if version == 2 {
-			if uint64(address) > math.MaxUint64-40 {
+			if uint64(address) > math.MaxUint64-uint64(word*5) {
 				return nil, target.ErrOverflow
 			}
-			next, err := memory.bytes(address+40, 8)
+			next, err := memory.bytes(address+target.Address(word*5), uint64(word))
 			if err != nil {
 				return nil, err
 			}
-			nextNamespace = target.Address(binary.LittleEndian.Uint64(next))
+			nextNamespace = target.Address(inspectionWord(next))
 			debug = append(debug, next...)
 		}
 		witnesses = append(witnesses, runtimeELFWitness{address, debug})
-		current := target.Address(binary.LittleEndian.Uint64(debug[8:]))
+		current := target.Address(inspectionWord(debug[word : 2*word]))
 		var previous target.Address
 		for current != 0 {
 			if len(links) == maxRuntimeELFModules {
@@ -847,23 +865,23 @@ func runtimeELFLinkMaps(memory *runtimeELFMemory, address target.Address) ([]run
 				return nil, fmt.Errorf("cyclic or shared runtime link_map node: %w", target.ErrInvalidArgument)
 			}
 			seenLinks[current] = true
-			data, err := memory.bytes(current, 40)
+			data, err := memory.bytes(current, uint64(word*5))
 			if err != nil {
 				return nil, err
 			}
-			if target.Address(binary.LittleEndian.Uint64(data[32:])) != previous {
+			if target.Address(inspectionWord(data[4*word:5*word])) != previous {
 				return nil, fmt.Errorf("runtime link_map reverse link mismatch: %w", target.ErrInvalidArgument)
 			}
 			witnesses = append(witnesses, runtimeELFWitness{current, data})
-			name, err := runtimeELFString(memory, target.Address(binary.LittleEndian.Uint64(data[8:])))
+			name, err := runtimeELFString(memory, target.Address(inspectionWord(data[word:2*word])))
 			if err != nil {
 				return nil, err
 			}
 			links = append(links, runtimeLinkMap{
-				namespace: address, address: current, bias: binary.LittleEndian.Uint64(data),
-				dynamic: target.Address(binary.LittleEndian.Uint64(data[16:])), name: name,
+				namespace: address, address: current, bias: inspectionWord(data[:word]),
+				dynamic: target.Address(inspectionWord(data[2*word : 3*word])), name: name,
 			})
-			previous, current = current, target.Address(binary.LittleEndian.Uint64(data[24:]))
+			previous, current = current, target.Address(inspectionWord(data[3*word:4*word]))
 		}
 		address = nextNamespace
 	}

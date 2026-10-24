@@ -139,6 +139,9 @@ func (c *Controller) addWatchpoint(ctx context.Context, expression string, reque
 	if err != nil {
 		return err
 	}
+	if snapshot.Architecture == target.X86 && request.Size == 8 {
+		return fmt.Errorf("x86 watchpoints support 1, 2 or 4 bytes: %w", target.ErrUnsupported)
+	}
 	backend, ok := c.session.(watchpointSession)
 	if !ok {
 		return fmt.Errorf("hardware watchpoints: %w", target.ErrUnsupported)
@@ -146,7 +149,7 @@ func (c *Controller) addWatchpoint(ctx context.Context, expression string, reque
 	c.reconcileWatchpoints(snapshot)
 	var used [4]bool
 	for _, point := range c.watchpoints {
-		if point.expired || point.thread != thread.Ref || point.space != snapshot.Memory.Space {
+		if point.expired || point.thread != thread.Ref && !c.qemuMode() || point.space != snapshot.Memory.Space {
 			continue
 		}
 		if point.attempted && (!point.installed || point.err != nil) {
@@ -162,6 +165,9 @@ func (c *Controller) addWatchpoint(ctx context.Context, expression string, reque
 		}
 	}
 	if request.Slot < 0 {
+		if c.qemuMode() {
+			return fmt.Errorf("all four remote watchpoint handles are owned: %w", target.ErrBusy)
+		}
 		return fmt.Errorf("all four thread-local hardware slots are owned: %w", target.ErrBusy)
 	}
 	resolver, err := c.mutationResolver(ctx, snapshot, thread)
@@ -175,6 +181,9 @@ func (c *Controller) addWatchpoint(ctx context.Context, expression string, reque
 	request.Address = target.Address(address)
 	if err := mutationRange(request.Address, request.Size); err != nil {
 		return err
+	}
+	if address > c.abi().maximum || uint64(request.Size-1) > c.abi().maximum-address {
+		return target.ErrOverflow
 	}
 	if uint64(request.Address)%uint64(request.Size) != 0 {
 		return fmt.Errorf("watchpoint address must be aligned to its %d-byte size: %w", request.Size, target.ErrInvalidArgument)
@@ -200,8 +209,11 @@ func (c *Controller) addWatchpoint(ctx context.Context, expression string, reque
 	if point.err != nil {
 		return fmt.Errorf("watchpoint thread=%d slot=%d installation is retained for cleanup: %w", thread.Ref.ID, request.Slot, point.err)
 	}
-	return c.writef("Watchpoint thread=%d tid=%d slot=%d generation=%d address=%#x size=%d access=%s\n",
-		thread.Ref.ID, thread.TID, point.ref.Slot, point.ref.Generation, request.Address, request.Size, request.Access)
+	if c.qemuMode() {
+		return c.writef("Watchpoint all-vCPUs slot=%d address=%s size=%d access=%s\n", point.ref.Slot, c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", request.Address)), request.Size, request.Access)
+	}
+	return c.writef("Watchpoint thread=%d tid=%d slot=%d address=%s size=%d access=%s\n",
+		thread.Ref.ID, thread.TID, point.ref.Slot, c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", request.Address)), request.Size, request.Access)
 }
 
 func (c *Controller) deleteWatchpoint(ctx context.Context, slot int) error {
@@ -217,7 +229,7 @@ func (c *Controller) deleteWatchpoint(ctx context.Context, slot int) error {
 	var point *watchRecord
 	var index int
 	for i, candidate := range c.watchpoints {
-		if !candidate.expired && candidate.thread == thread.Ref && candidate.space == snapshot.Memory.Space && candidate.request.Slot == slot {
+		if !candidate.expired && (candidate.thread == thread.Ref || c.qemuMode()) && candidate.space == snapshot.Memory.Space && candidate.request.Slot == slot {
 			point, index = candidate, i
 			break
 		}
@@ -225,7 +237,7 @@ func (c *Controller) deleteWatchpoint(ctx context.Context, slot int) error {
 	if point == nil {
 		return fmt.Errorf("thread %d watchpoint slot %d: %w", thread.Ref.ID, slot, target.ErrNotFound)
 	}
-	if !point.installed || point.ref.Thread != thread.Ref || point.ref.Generation == 0 || point.ref.Slot != slot {
+	if !point.installed || point.ref.Thread != thread.Ref && !c.qemuMode() || point.ref.Generation == 0 || point.ref.Slot != slot {
 		return fmt.Errorf("watchpoint installation has no confirmed handle; release the session for cleanup: %w", errors.Join(target.ErrUnavailable, point.err))
 	}
 	if err := contextReady(ctx); err != nil {
@@ -244,7 +256,10 @@ func (c *Controller) deleteWatchpoint(ctx context.Context, slot int) error {
 	if err := errors.Join(clearErr, snapshotErr, ctx.Err()); err != nil {
 		return fmt.Errorf("remove watchpoint thread=%d slot=%d generation=%d: %w", thread.Ref.ID, slot, point.ref.Generation, err)
 	}
-	return c.writef("Removed watchpoint thread=%d slot=%d generation=%d\n", thread.Ref.ID, slot, point.ref.Generation)
+	if c.qemuMode() {
+		return c.writef("Removed watchpoint all-vCPUs slot=%d\n", slot)
+	}
+	return c.writef("Removed watchpoint thread=%d slot=%d\n", thread.Ref.ID, slot)
 }
 
 func (c *Controller) listWatchpoints() error {
@@ -263,10 +278,10 @@ func (c *Controller) listWatchpoints() error {
 	if len(c.watchpoints) == 0 {
 		return c.writef("No watchpoints configured by this controller.\n")
 	}
-	if err := c.writef("%s\n", c.renderer.Section("watchpoints: debugger-owned", display.OutputWidth(c.out))); err != nil {
+	if err := c.writef("%s\n", c.renderer.Section("watchpoints", display.OutputWidth(c.out))); err != nil {
 		return err
 	}
-	if err := c.writef("%s\n", c.renderer.Text(display.StyleHeading, fmt.Sprintf("%-8s %-5s %-11s %-5s %-18s %-12s %s", "Thread", "Slot", "Access", "Size", "Address", "State", "Generation"))); err != nil {
+	if err := c.writef("%s\n", c.renderer.Text(display.StyleHeading, fmt.Sprintf("%-8s %-5s %-11s %-5s %-18s %s", "Thread", "Slot", "Access", "Size", "Address", "State"))); err != nil {
 		return err
 	}
 	for _, point := range c.watchpoints {
@@ -277,19 +292,10 @@ func (c *Controller) listWatchpoints() error {
 		if point.expired {
 			state = "invalidated"
 		}
-		generation := "unknown"
-		if point.ref.Generation != 0 {
-			generation = strconv.FormatUint(point.ref.Generation, 10)
-		}
-		if err := c.writef("%-8s %-5d %-11s %-5d 0x%016x %-12s %s\n",
-			fmt.Sprintf("#%d", point.thread.ID), point.request.Slot, point.request.Access, point.request.Size,
-			point.request.Address, state, generation); err != nil {
+		if err := c.writef("%-8s %-5d %-11s %-5d %s %s\n",
+			watchThreadLabel(point.thread, c.qemuMode()), point.request.Slot, point.request.Access, point.request.Size,
+			c.renderer.Text(display.StyleCyan, fmt.Sprintf("0x%0*x", c.abi().word*2, point.request.Address)), state); err != nil {
 			return err
-		}
-		if point.expired || !point.installed || point.err != nil {
-			if err := c.writef("  Handle: session %d, address space %d.\n", point.thread.Session, point.space.ID); err != nil {
-				return err
-			}
 		}
 		if point.err != nil {
 			if err := c.writef("  Error: %q\n", point.err.Error()); err != nil {
@@ -298,4 +304,11 @@ func (c *Controller) listWatchpoints() error {
 		}
 	}
 	return nil
+}
+
+func watchThreadLabel(ref target.ThreadRef, remote bool) string {
+	if remote {
+		return "all"
+	}
+	return fmt.Sprintf("#%d", ref.ID)
 }

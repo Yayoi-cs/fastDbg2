@@ -40,13 +40,13 @@ func TestVMMapUIPermissionColorCoversEveryRowAndContinuation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			codes := []string{"31", "36", "34", "33", "32", "90"}
+			codes := []string{"35", "36", "34", "33", "32", ""}
 			lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 			data := false
 			for _, line := range lines {
 				plain := vmmapTestSGR.ReplaceAllString(line, "")
 				data = data || strings.HasPrefix(plain, "0x")
-				if data && (!strings.HasPrefix(line, "\x1b["+codes[index]+"m") || !strings.HasSuffix(line, "\x1b[0m")) {
+				if data && ((codes[index] == "" && line != plain) || (codes[index] != "" && (!strings.HasPrefix(line, "\x1b["+codes[index]+"m") || !strings.HasSuffix(line, "\x1b[0m")))) {
 					t.Fatalf("row fragment lacks full permission color: %q", line)
 				}
 				if display.VisibleWidth(line) > 80 {

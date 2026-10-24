@@ -109,7 +109,7 @@ func TestHeapChunkExplicitRawLayoutAndWords(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"[chunk]", "Layout     : glibc-amd64 (user-selected)", "allocation ownership and state are not determined",
+		"[chunk]",
 		"header=0x0000000000001000", "+0x00 prev_size", "0x0000000000000010", "+0x08 raw_size", "0x0000000000000047",
 		"+0x10 stored_word[0]", "0x1122334455667788", "+0x18 stored_word[1]", "0xffeeddccbbaa9988",
 		"+0x20 stored_word[2]", "0x0102030405060708", "+0x28 stored_word[3]", "0x0807060504030201",
@@ -149,7 +149,7 @@ func TestHeapChunkExtraWordsAreExplicitRawOffsetsNotOwnedPayload(t *testing.T) {
 	}
 	if len(fixture.stackCalls) != 1 || fixture.stackCalls[0].size != 48 ||
 		!strings.Contains(output.String(), "+0x28 stored_word[3]") || !strings.Contains(output.String(), "size=0x20") ||
-		!strings.Contains(output.String(), "Extra words are explicit raw reads at header+offset; no ownership within this chunk is asserted.") {
+		!strings.Contains(output.String(), "stored_word[3]") {
 		t.Fatalf("reads=%v output=%q", fixture.stackCalls, output.String())
 	}
 }
@@ -267,7 +267,7 @@ func TestVisualHeapExplicitRangeAndOneSnapshot(t *testing.T) {
 	}
 	if fixture.snapshotReads != 1 || len(fixture.registerTokens) != 1 || len(fixture.stackCalls) != 3 ||
 		!strings.Contains(output.String(), "headers=3 covered=0x90") || !strings.Contains(output.String(), "P=1 M=1 A=1") ||
-		!strings.Contains(output.String(), "Layout     : glibc-amd64 (user-selected)") {
+		strings.Contains(output.String(), "Layout     : glibc-amd64 (user-selected)") {
 		t.Fatalf("reads=%+v output=%q", fixture, output.String())
 	}
 }

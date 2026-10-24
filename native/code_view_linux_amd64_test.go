@@ -382,7 +382,11 @@ func TestNativeCodeViewStateValidation(t *testing.T) {
 		{"exited", func(e *engine, th *thread) { e.life.terminal = target.StateExited }, target.ErrExited},
 		{"detached", func(e *engine, th *thread) { e.life.terminal = target.StateDetached }, target.ErrDetached},
 		{"closed", func(e *engine, th *thread) { e.life.terminal = target.StateClosed }, target.ErrClosed},
-		{"x86", func(e *engine, th *thread) { profile := x86.Descriptor(); th.process.profile = &profile }, target.ErrUnsupported},
+		{"unsupported architecture", func(e *engine, th *thread) {
+			profile := x86.Descriptor()
+			profile.Architecture = target.AArch64
+			th.process.profile = &profile
+		}, target.ErrUnsupported},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			e, th := nativeDataTokenEngine()
@@ -473,15 +477,15 @@ func TestNativeCodeViewExecInvalidatesOldImage(t *testing.T) {
 	}
 }
 
-func TestNativeCodeViewX86AndClosedSessionRejected(t *testing.T) {
+func TestNativeCodeViewX86AndClosedSession(t *testing.T) {
 	path, entry := coreAssembly(t, 32, ".text\n.global _start\n_start:\n nop\n jmp _start\n")
 	s := codeViewSession(t, path)
 	snapshot := nativeDataSnapshot(t, s)
-	if _, err := s.ReadCodeLocation(snapshot.Threads[0].Token); !errors.Is(err, target.ErrUnsupported) {
+	if location, err := s.ReadCodeLocation(snapshot.Threads[0].Token); err != nil || location.InstructionPC != entry {
 		t.Fatalf("x86 location error=%v", err)
 	}
 	dst := []byte{0x55}
-	if n, err := s.ReadCodeMemory(snapshot.Memory, entry, dst); n != 0 || !errors.Is(err, target.ErrUnsupported) || dst[0] != 0x55 {
+	if n, err := s.ReadCodeMemory(snapshot.Memory, entry, dst); n != 1 || err != nil || dst[0] != 0x90 {
 		t.Fatalf("x86 code=%x n=%d error=%v", dst, n, err)
 	}
 	if err := coreClose(t, s); err != nil {
@@ -490,7 +494,7 @@ func TestNativeCodeViewX86AndClosedSessionRejected(t *testing.T) {
 	if _, err := s.ReadCodeLocation(snapshot.Threads[0].Token); !errors.Is(err, target.ErrClosed) {
 		t.Fatalf("closed location error=%v", err)
 	}
-	if n, err := s.ReadCodeMemory(snapshot.Memory, entry, dst); n != 0 || !errors.Is(err, target.ErrClosed) || dst[0] != 0x55 {
+	if n, err := s.ReadCodeMemory(snapshot.Memory, entry, dst); n != 0 || !errors.Is(err, target.ErrClosed) || dst[0] != 0x90 {
 		t.Fatalf("closed code=%x n=%d error=%v", dst, n, err)
 	}
 }

@@ -35,6 +35,8 @@ type searchArguments struct {
 	bigEndian  bool
 	maxBytes   uint64
 	maxMatches int
+	noTUI      bool
+	pager      bool
 }
 
 type searchSpan struct {
@@ -82,11 +84,19 @@ func parseSearchArguments(kind, rawArgs string) (searchArguments, error) {
 		return options, fmt.Errorf("%s arguments: %w: %v", kind, target.ErrInvalidArgument, err)
 	}
 	seen := make(map[string]bool)
-	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+	for len(args) > 0 && (strings.HasPrefix(args[0], "--") || kind == "findruction" && args[0] == "-n") {
 		name := args[0]
 		args = args[1:]
 		if name == "--" {
 			break
+		}
+		if kind == "findruction" && (name == "-n" || name == "--no-tui" || name == "--pager") {
+			if options.noTUI || options.pager {
+				return options, fmt.Errorf("choose one output mode: %w", target.ErrInvalidArgument)
+			}
+			options.noTUI = name != "--pager"
+			options.pager = name == "--pager"
+			continue
 		}
 		if seen[name] || len(args) == 0 {
 			return options, fmt.Errorf("%s needs one value and may appear once: %w", name, target.ErrInvalidArgument)
@@ -321,7 +331,11 @@ func (c *Controller) commandSearch(ctx context.Context, kind, rawArgs string) er
 	}
 	pattern := []byte(options.value)
 	if kind == "findruction" {
-		pattern, err = assembleAMD64(ctx, options.value)
+		arch, archErr := c.assemblyArchitecture()
+		if archErr != nil {
+			return archErr
+		}
+		pattern, err = assembleNative(ctx, options.value, arch)
 		if err != nil {
 			return err
 		}
@@ -366,15 +380,30 @@ func (c *Controller) commandSearch(ctx context.Context, kind, rawArgs string) er
 	if errors.Is(searchErr, target.ErrStale) || errors.Is(searchErr, context.Canceled) || errors.Is(searchErr, context.DeadlineExceeded) || ctx.Err() != nil {
 		return errors.Join(searchErr, ctx.Err())
 	}
+	var groups []findructionGroup
+	if kind == "findruction" {
+		groups = findructionMemoryGroups(maps, spans, result.addresses)
+		for i := range groups {
+			groups[i].arch = snapshot.Architecture
+		}
+		previewErr := findructionPreviews(ctx, reader, groups, c.findructionPreviewCount(options))
+		if uiDisplayFatal(previewErr) {
+			return errors.Join(searchErr, previewErr)
+		}
+		searchErr = errors.Join(searchErr, previewErr)
+	}
 	if err := c.verifyProcSnapshot(snapshot, thread); err != nil {
 		return errors.Join(searchErr, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return errors.Join(searchErr, err)
 	}
-	source, addressKind := "live-raw", display.AddressUnknown
+	if kind == "findruction" {
+		return c.publishFindruction(ctx, groups, pattern, options, searchErr)
+	}
+	source := "live-raw"
 	if reader.code {
-		source, addressKind = "live-logical", display.AddressCode
+		source = "live-logical"
 	}
 	if err := c.searchHeading(source, scope, pattern, result, searchErr); err != nil {
 		return errors.Join(searchErr, err)
@@ -383,10 +412,7 @@ func (c *Controller) commandSearch(ctx context.Context, kind, rawArgs string) er
 		if err := ctx.Err(); err != nil {
 			return errors.Join(searchErr, err)
 		}
-		text, err := c.renderer.Address(target.AMD64, address, addressKind)
-		if err != nil {
-			return errors.Join(searchErr, err)
-		}
+		text := (&metadataView{renderer: c.renderer}).address(address, maps)
 		if err := c.writef("  %s\n", text); err != nil {
 			return errors.Join(searchErr, err)
 		}
@@ -395,21 +421,11 @@ func (c *Controller) commandSearch(ctx context.Context, kind, rawArgs string) er
 }
 
 func (c *Controller) searchHeading(source, scope string, pattern []byte, result searchResult, searchErr error) error {
-	status := "complete"
-	state := metadataPresent
+	status := ""
 	if searchErr != nil {
-		status = "partial"
-		state = metadataPartial
+		status = " (partial)"
 	}
-	view := c.metadataView()
-	view.heading("search")
-	view.field("Source", source, metadataPlain)
-	view.field("Scope", scope, metadataPlain)
-	view.field("Pattern", fmt.Sprintf("%x (%d bytes)", pattern, len(pattern)), metadataPlain)
-	view.field("Matches", fmt.Sprintf("%d confirmed byte match(es)", len(result.addresses)), metadataPlain)
-	view.field("Bytes read", fmt.Sprint(result.bytesRead), metadataPlain)
-	view.field("Status", status, state)
-	return c.writef("%s", view.output.String())
+	return c.writef("Found %s match(es)%s\n", c.renderer.Text(display.StyleCyan, strconv.Itoa(len(result.addresses))), status)
 }
 
 func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, options searchArguments) (err error) {
@@ -438,7 +454,7 @@ func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, op
 	if err != nil {
 		return err
 	}
-	if err := validateAMD64ELF(image); err != nil {
+	if err := validateNativeELF(image); err != nil {
 		return err
 	}
 	var segments []*elf.Prog
@@ -446,7 +462,7 @@ func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, op
 		if segment.Type != elf.PT_LOAD || segment.Flags&elf.PF_X == 0 || segment.Filesz == 0 {
 			continue
 		}
-		if segment.Off > uint64(info.Size()) || segment.Filesz > uint64(info.Size())-segment.Off || segment.Filesz-1 > math.MaxUint64-segment.Vaddr || segment.Filesz > segment.Memsz {
+		if segment.Off > uint64(info.Size()) || segment.Filesz > uint64(info.Size())-segment.Off || segment.Filesz > math.MaxUint64-segment.Vaddr || segment.Filesz > segment.Memsz {
 			return fmt.Errorf("invalid executable ELF segment: %w", target.ErrInvalidArgument)
 		}
 		segments = append(segments, segment)
@@ -455,7 +471,7 @@ func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, op
 		return fmt.Errorf("ELF has no nonempty executable PT_LOAD: %w", target.ErrNotFound)
 	}
 	var result searchResult
-	var offsets []target.Address
+	var groups []findructionGroup
 	var failures []error
 	var planned uint64
 	for _, segment := range segments {
@@ -474,10 +490,15 @@ func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, op
 		}
 		planned += min(segment.Filesz, options.maxBytes-planned)
 		result.bytesRead += part.bytesRead
+		arch, _ := nativeELFArchitecture(image)
+		group := findructionGroup{arch: arch, label: c.path, start: target.Address(segment.Vaddr), end: target.Address(segment.Vaddr + segment.Filesz), file: true}
 		for _, offset := range part.addresses {
-			offsets = append(offsets, offset)
-			result.addresses = append(result.addresses, target.Address(segment.Vaddr)+(offset-target.Address(segment.Off)))
+			address := target.Address(segment.Vaddr) + (offset - target.Address(segment.Off))
+			result.addresses = append(result.addresses, address)
+			group.matches = append(group.matches, findructionMatch{address: address, offset: offset, readAddress: offset})
 		}
+		groups = append(groups, group)
+
 		if readErr != nil {
 			failures = append(failures, readErr)
 			if errors.Is(readErr, target.ErrOverflow) {
@@ -486,6 +507,11 @@ func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, op
 		}
 	}
 	searchErr := errors.Join(failures...)
+	previewErr := findructionPreviews(ctx, searchFileReader{file}, groups, c.findructionPreviewCount(options))
+	if uiDisplayFatal(previewErr) {
+		return errors.Join(searchErr, previewErr)
+	}
+	searchErr = errors.Join(searchErr, previewErr)
 	after, err := file.Stat()
 	if err != nil {
 		return errors.Join(searchErr, err)
@@ -496,17 +522,5 @@ func (c *Controller) searchConfiguredELF(ctx context.Context, pattern []byte, op
 	if err := ctx.Err(); err != nil {
 		return errors.Join(searchErr, err)
 	}
-	scope := fmt.Sprintf("ELF executable PT_LOAD file=%q", c.path)
-	if err := c.searchHeading("file-unrelocated", scope, pattern, result, searchErr); err != nil {
-		return errors.Join(searchErr, err)
-	}
-	for i, address := range result.addresses {
-		if err := ctx.Err(); err != nil {
-			return errors.Join(searchErr, err)
-		}
-		if err := c.writef("  elf-vaddr=0x%016x file-offset=0x%x\n", address, offsets[i]); err != nil {
-			return errors.Join(searchErr, err)
-		}
-	}
-	return searchErr
+	return c.publishFindruction(ctx, groups, pattern, options, searchErr)
 }

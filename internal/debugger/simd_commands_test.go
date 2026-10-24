@@ -148,7 +148,7 @@ func TestSIMDFXSaveDoesNotInventBitmapOrAVX(t *testing.T) {
 	if err := controller.showSIMD(context.Background(), "simd", ""); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"format=linux-x86-fxsave", "MXCSR_MASK: 0x00000000", "XSTATE_BV: unavailable (FXSAVE has no component bitmap)", "unsupported by this register state", "XMM15 ", "ST(7)"} {
+	for _, want := range []string{"MXCSR_MASK: 0x00000000", "XSTATE_BV: unavailable (FXSAVE has no component bitmap)", "unsupported by this register state", "XMM15 ", "ST(7)"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing %q in %q", want, output.String())
 		}
@@ -168,7 +168,7 @@ func TestSIMDRejectsMalformedStateBeforeOutput(t *testing.T) {
 		name   string
 		modify func(*target.ExtendedRegisterState)
 	}{
-		{"architecture", func(state *target.ExtendedRegisterState) { state.Architecture = target.X86 }},
+		{"architecture", func(state *target.ExtendedRegisterState) { state.Architecture = target.AArch64 }},
 		{"unknown-format", func(state *target.ExtendedRegisterState) { state.Format = target.ExtendedFormatUnknown }},
 		{"nil-data", func(state *target.ExtendedRegisterState) { state.Data = nil }},
 		{"truncated-header", func(state *target.ExtendedRegisterState) { state.Data = state.Data[:575] }},
@@ -371,7 +371,7 @@ func TestSIMDRequiresOptionalCapabilityAndInspectableThread(t *testing.T) {
 		func(_ *Controller, fixture *simdReadFixture) { fixture.snapshot.Threads[0].Exiting = true },
 		func(_ *Controller, fixture *simdReadFixture) { fixture.snapshot.Threads[0].Listening = true },
 		func(controller *Controller, _ *simdReadFixture) { controller.selected.ID++ },
-		func(_ *Controller, fixture *simdReadFixture) { fixture.snapshot.Architecture = target.X86 },
+		func(_ *Controller, fixture *simdReadFixture) { fixture.snapshot.Architecture = target.AArch64 },
 	} {
 		controller, fixture, output := newSIMDTestController(target.ExtendedFormatXSave)
 		alter(controller, fixture)

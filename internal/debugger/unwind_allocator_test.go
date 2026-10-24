@@ -109,7 +109,7 @@ func TestUnwindNativeDefaultAllocatorBreakpoints(t *testing.T) {
 						t.Fatalf("default bt at %s: %v\n%s", name, err, output.String())
 					}
 					text := output.String()
-					for _, want := range []string{"ABI: sysv-amd64 (native default)", name, "allocation_inner", "allocation_outer", "<main+", "[libc.so.6]", "[main]", "End of stack (CFI return address undefined)."} {
+					for _, want := range []string{"Thread ", name, "allocation_inner", "allocation_outer", "<main+", "[libc.so.6]", "[main]"} {
 						if !strings.Contains(text, want) {
 							t.Fatalf("%s missing %q:\n%s", name, want, text)
 						}

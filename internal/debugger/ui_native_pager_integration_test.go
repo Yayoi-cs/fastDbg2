@@ -387,7 +387,7 @@ func TestUINativePagerPreservesStoppedSnapshot(t *testing.T) {
 				}
 				marker := []byte("[symbols]")
 				if name == "telescope" {
-					marker = []byte("[telescope]")
+					marker = []byte("|+0x0000|+000:")
 				}
 				var output bytes.Buffer
 				data := make([]byte, 8192)
@@ -412,7 +412,7 @@ func TestUINativePagerPreservesStoppedSnapshot(t *testing.T) {
 					}
 					page, err := os.ReadFile(string(bytes.Split(arguments, []byte{0})[4]))
 					rows := strings.Split(strings.TrimSuffix(string(page), "\n"), "\n")
-					if err != nil || len(rows) != 3 || display.VisibleWidth(rows[1]) <= 80 || strings.Count(rows[1], " -> ") < 2 {
+					if err != nil || len(rows) != 2 || display.VisibleWidth(rows[0]) <= 80 || strings.Count(rows[0], " -> ") < 2 {
 						t.Fatalf("native telescope lost logical rows before less: error=%v page=%q", err, page)
 					}
 				}

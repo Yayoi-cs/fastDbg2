@@ -80,6 +80,21 @@ func (c *Controller) withELFModules(ctx context.Context, snapshot target.Snapsho
 	if visit == nil || selection.All && selection.Name != "" {
 		return target.ErrInvalidArgument
 	}
+	if remote, ok := c.session.(*qemuSession); ok {
+		if err := c.verifyProcSnapshot(snapshot, thread); err != nil {
+			return err
+		}
+		if remote.image == nil {
+			return fmt.Errorf("ELF metadata requires --vmlinux: %w", target.ErrUnavailable)
+		}
+		if selection.Name != "" && selection.Name != "main" && selection.Name != "kernel" && selection.Name != remote.image.path {
+			return target.ErrNotFound
+		}
+		if err := remote.image.validate(); err != nil {
+			return err
+		}
+		return visit([]*mappedELF{remote.image.module()})
+	}
 	var discoveryErr error
 	err := c.withStoppedProc(ctx, snapshot, thread, func(proc *stoppedProc) (err error) {
 		var modules []*mappedELF
@@ -103,9 +118,27 @@ func (c *Controller) withELFModules(ctx context.Context, snapshot target.Snapsho
 		if !selection.All && (selection.Name == "" || selection.Name == "main") {
 			return visit(modules)
 		}
+		if snapshot.Architecture == target.X86 {
+			extra, scanErr := c.x86MappedModules(ctx, snapshot, proc, main, mappings)
+			for _, module := range extra {
+				modules = append(modules, module)
+				if module.Source != nil {
+					sources = append(sources, module.Source)
+				}
+			}
+			if runtimeELFFatal(scanErr) {
+				return scanErr
+			}
+			discoveryErr = scanErr
+			selected, err := selectELFModules(modules, selection)
+			if err != nil {
+				return errors.Join(err, scanErr)
+			}
+			return visit(selected)
+		}
 		var loader *runtimeELFView
 		var membership map[mappedELFIdentity][]runtimeLinkMap
-		if selection.All {
+		if selection.All && snapshot.Architecture == target.AMD64 {
 			view, runtimeErr := c.runtimeELFModulesWithMain(ctx, snapshot, proc, main)
 			if view != nil && view.Memory != nil {
 				defer view.Memory.close()
@@ -167,7 +200,7 @@ func (c *Controller) withELFModules(ctx context.Context, snapshot target.Snapsho
 			sources = append(sources, module.Source)
 			modules = append(modules, module)
 		}
-		if !selection.All && selection.Name != "" {
+		if !selection.All && selection.Name != "" && snapshot.Architecture == target.AMD64 {
 			runtimeModules, runtimeErr := c.namedRuntimeELFMetadata(ctx, snapshot, proc)
 			if runtimeELFFatal(runtimeErr) {
 				return runtimeErr
@@ -236,7 +269,7 @@ func openIdentityMappedELF(proc *stoppedProc, group []procMap, identity mappedEL
 	if err != nil {
 		return nil, err
 	}
-	if err := validateAMD64ELF(file); err != nil {
+	if err := validateNativeELF(file); err != nil {
 		return nil, err
 	}
 	if err := verifyMappedELFGroup(proc, group, source); err != nil {
@@ -257,7 +290,7 @@ func parseAMD64ELFSource(source *os.File) (*elf.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := validateAMD64ELF(file); err != nil {
+	if err := validateNativeELF(file); err != nil {
 		return nil, err
 	}
 	return file, nil
@@ -285,7 +318,7 @@ func openMainELF(proc *stoppedProc, mappings []procMap, page uint64) (module *ma
 	if err != nil {
 		return nil, err
 	}
-	bias, err := imageLoadBias(file.Type, file.Entry, auxv)
+	bias, err := imageLoadBiasForELF(file, auxv)
 	if err != nil {
 		return nil, err
 	}

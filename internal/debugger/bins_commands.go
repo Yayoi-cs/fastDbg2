@@ -199,7 +199,7 @@ func (c *Controller) showBins(ctx context.Context, rawArgs string) error {
 	if outputErr := c.heapGraphHeading(ctx, "bins", input); outputErr != nil {
 		return errors.Join(err, outputErr)
 	}
-	if outputErr := c.heapGraphWritef(ctx, "arena=0x%016x (%d/%d confirmed bytes).\n", input.address, len(observation.arena.data), input.layout.Arena.Size); outputErr != nil {
+	if outputErr := c.heapGraphWritef(ctx, "arena=0x%0*x (%d/%d confirmed bytes).\n", c.abi().word*2, input.address, len(observation.arena.data), input.layout.Arena.Size); outputErr != nil {
 		return errors.Join(err, outputErr)
 	}
 	if input.tcacheAddress == nil {
@@ -214,15 +214,15 @@ func (c *Controller) showBins(ctx context.Context, rawArgs string) error {
 		if outputErr := c.heapGraphWritef(ctx, "%s", text); outputErr != nil {
 			return errors.Join(err, outputErr)
 		}
-	} else if outputErr := c.heapGraphWritef(ctx, "tcache=0x%016x was not inspected after the global budget was exhausted.\n", *input.tcacheAddress); outputErr != nil {
+	} else if outputErr := c.heapGraphWritef(ctx, "tcache=0x%0*x was not inspected after the global budget was exhausted.\n", c.abi().word*2, *input.tcacheAddress); outputErr != nil {
 		return errors.Join(err, outputErr)
 	}
 	for _, bin := range observation.bins {
-		if outputErr := c.heapGraphWritef(ctx, "%s head=0x%016x", bin.name, bin.head); outputErr != nil {
+		if outputErr := c.heapGraphWritef(ctx, "%s head=0x%0*x", bin.name, c.abi().word*2, bin.head); outputErr != nil {
 			return errors.Join(err, outputErr)
 		}
 		if !bin.fast {
-			if outputErr := c.heapGraphWritef(ctx, " tail=0x%016x sentinel=0x%016x", bin.tail, bin.sentinel); outputErr != nil {
+			if outputErr := c.heapGraphWritef(ctx, " tail=0x%0*x sentinel=0x%0*x", c.abi().word*2, bin.tail, c.abi().word*2, bin.sentinel); outputErr != nil {
 				return errors.Join(err, outputErr)
 			}
 		}
@@ -230,15 +230,15 @@ func (c *Controller) showBins(ctx context.Context, rawArgs string) error {
 			return errors.Join(err, outputErr)
 		}
 		for _, node := range bin.nodes {
-			if outputErr := c.heapGraphWritef(ctx, "  0x%016x", node.address); outputErr != nil {
+			if outputErr := c.heapGraphWritef(ctx, "  0x%0*x", c.abi().word*2, node.address); outputErr != nil {
 				return errors.Join(err, outputErr)
 			}
 			if node.linked {
-				if outputErr := c.heapGraphWritef(ctx, " fd.stored=0x%016x next=0x%016x", node.stored, node.next); outputErr != nil {
+				if outputErr := c.heapGraphWritef(ctx, " fd.stored=0x%0*x next=0x%0*x", input.layout.Pointer*2, node.stored, c.abi().word*2, node.next); outputErr != nil {
 					return errors.Join(err, outputErr)
 				}
 				if !bin.fast {
-					if outputErr := c.heapGraphWritef(ctx, " bk=0x%016x", node.back); outputErr != nil {
+					if outputErr := c.heapGraphWritef(ctx, " bk=0x%0*x", c.abi().word*2, node.back); outputErr != nil {
 						return errors.Join(err, outputErr)
 					}
 				}

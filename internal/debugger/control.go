@@ -15,6 +15,15 @@ import (
 )
 
 func (c *Controller) start(ctx context.Context, rawArgs string, run bool) error {
+	if _, ok := c.session.(*qemuSession); ok {
+		if strings.TrimSpace(rawArgs) != "" {
+			return target.ErrInvalidArgument
+		}
+		if run {
+			return c.resume(ctx, "", false)
+		}
+		return c.showContext(ctx)
+	}
 	if c.path == "" {
 		return fmt.Errorf("configure an executable with file PATH first: %w", target.ErrInvalidState)
 	}
@@ -55,7 +64,7 @@ func (c *Controller) start(ctx context.Context, rawArgs string, run bool) error 
 		}
 		return err
 	}
-	if err := c.writef("Started native amd64 pid=%d executable=%q arguments=%q\n", s.PID(), c.path, c.args); err != nil {
+	if err := c.writef("Started native %s pid=%d executable=%q arguments=%q\n", c.abi().arch, s.PID(), c.path, c.args); err != nil {
 		return err
 	}
 	breakpointErr := c.installBreakpoints(ctx)
@@ -92,7 +101,7 @@ func (c *Controller) attachProcess(ctx context.Context, pid int) error {
 		}
 		return err
 	}
-	if err := c.writef("Attached native amd64 pid=%d\n", s.PID()); err != nil {
+	if err := c.writef("Attached native %s pid=%d\n", c.abi().arch, s.PID()); err != nil {
 		return err
 	}
 	breakpointErr := c.installBreakpoints(ctx)
@@ -264,12 +273,12 @@ func (c *Controller) showStop(ctx context.Context, stop target.Stop, ref target.
 		return err
 	}
 	if stop.RawPC != nil && (snapshot.State != target.StateStopped || stop.Reason == target.StopExited || stop.Reason == target.StopSignaled || c.contextDisabled && stop.Reason == target.StopBreakpoint && stop.Breakpoint != nil && *stop.Breakpoint != *stop.RawPC) {
-		if err := writeStatus(display.StylePlain, "  Raw PC: 0x%016x\n", *stop.RawPC); err != nil {
+		if err := writeStatus(display.StylePlain, "  Raw PC: 0x%0*x\n", c.abi().word*2, *stop.RawPC); err != nil {
 			return err
 		}
 	}
 	if stop.Breakpoint != nil && (stop.Reason != target.StopBreakpoint || snapshot.State != target.StateStopped) {
-		if err := writeStatus(display.StylePlain, "  Breakpoint address: 0x%016x\n", *stop.Breakpoint); err != nil {
+		if err := writeStatus(display.StylePlain, "  Breakpoint address: 0x%0*x\n", c.abi().word*2, *stop.Breakpoint); err != nil {
 			return err
 		}
 	}
@@ -291,14 +300,14 @@ func (c *Controller) showStop(ctx context.Context, stop target.Stop, ref target.
 		}
 	}
 	for _, hit := range stop.Watchpoints {
-		if err := writeStatus(display.StylePlain, "  Watchpoint: thread #%d, slot %d, generation %d; %s %d byte(s) at 0x%016x (session %d).\n",
-			hit.Ref.Thread.ID, hit.Ref.Slot, hit.Ref.Generation, hit.Access, hit.Size, hit.Address, hit.Ref.Thread.Session); err != nil {
+		if err := writeStatus(display.StylePlain, "  Watchpoint: thread #%d, slot %d; %s %d byte(s) at 0x%0*x.\n",
+			hit.Ref.Thread.ID, hit.Ref.Slot, hit.Access, hit.Size, c.abi().word*2, hit.Address); err != nil {
 			return err
 		}
 	}
 	for _, hit := range stop.HardwareBreakpoints {
-		if err := writeStatus(display.StylePlain, "  Hardware breakpoint: thread #%d, slot %d, generation %d; execution at 0x%016x (session %d).\n",
-			hit.Ref.Thread.ID, hit.Ref.Slot, hit.Ref.Generation, hit.Address, hit.Ref.Thread.Session); err != nil {
+		if err := writeStatus(display.StylePlain, "  Hardware breakpoint: thread #%d, slot %d; execution at 0x%0*x.\n",
+			hit.Ref.Thread.ID, hit.Ref.Slot, c.abi().word*2, hit.Address); err != nil {
 			return err
 		}
 	}
@@ -326,7 +335,10 @@ func (c *Controller) statusText(style display.Style, format string, args ...any)
 }
 
 func statusDebuggerTrap(stop target.Stop) bool {
-	if stop.Signal.Domain != target.SignalLinux || stop.Signal.Number != uint32(unix.SIGTRAP) {
+	if stop.Signal.Domain == target.SignalGDB && stop.Signal.Number == 2 && stop.Reason == target.StopInterrupt {
+		return true
+	}
+	if (stop.Signal.Domain != target.SignalLinux && stop.Signal.Domain != target.SignalGDB) || stop.Signal.Number != uint32(unix.SIGTRAP) {
 		return false
 	}
 	switch stop.Reason {
@@ -400,7 +412,7 @@ func statusStopSummary(snapshot target.Snapshot, stop target.Stop, ref target.Th
 		pc = stop.Breakpoint
 	}
 	if pc != nil {
-		location = fmt.Sprintf(" at 0x%016x", *pc)
+		location = fmt.Sprintf(" at 0x%0*x", abiFor(snapshot.Architecture).word*2, *pc)
 	}
 	if stop.Reason == target.StopSignal {
 		return fmt.Sprintf("%s stopped by %s%s.", subject, statusSignal(stop.Signal), location)
@@ -426,6 +438,7 @@ func (c *Controller) releaseTarget(kill bool) error {
 		return fmt.Errorf("no target: %w", target.ErrInvalidState)
 	}
 	pid := c.session.PID()
+	_, remote := c.session.(*qemuSession)
 	var err error
 	action := "Detached"
 	if kill {
@@ -441,6 +454,9 @@ func (c *Controller) releaseTarget(kill bool) error {
 	if err := c.Close(); err != nil {
 		return err
 	}
+	if remote {
+		return c.writef("%s QEMU.\n", action)
+	}
 	return c.writef("%s pid=%d\n", action, pid)
 }
 
@@ -450,6 +466,10 @@ func (c *Controller) Close() error {
 	}
 	if err := c.session.Close(); err != nil {
 		return fmt.Errorf("session remains retained for cleanup: %w", err)
+	}
+	if c.qemuMode() {
+		c.path = ""
+		c.args = nil
 	}
 	c.session = nil
 	c.snapshot = target.Snapshot{}

@@ -23,13 +23,14 @@ semantics = dict(source_model['Semantics'])
 
 def elf_data(path):
     data = open(path, 'rb').read()
-    if data[:7] != b'\x7fELF\x02\x01\x01' or struct.unpack_from('<H', data, 18)[0] != 62:
+    is32 = data[4] == 1
+    if data[:4] != b'\x7fELF' or data[5:7] != b'\x01\x01' or struct.unpack_from('<H',data,18)[0] != (3 if is32 else 62):
         raise ValueError('requires little-endian AMD64 ELF64')
-    offset = struct.unpack_from('<Q', data, 40)[0]
-    size, count, names = struct.unpack_from('<HHH', data, 58)
-    if size != 64 or not count or names >= count or offset + count * size > len(data):
+    offset = struct.unpack_from('<I' if is32 else '<Q',data,32 if is32 else 40)[0]
+    size, count, names = struct.unpack_from('<HHH',data,46 if is32 else 58)
+    if size != (40 if is32 else 64) or not count or names >= count or offset + count * size > len(data):
         raise ValueError('unsupported section table')
-    sections = [struct.unpack_from('<IIQQQQIIQQ', data, offset + i * size) for i in range(count)]
+    sections = [struct.unpack_from('<IIIIIIIIII' if is32 else '<IIQQQQIIQQ',data,offset+i*size) for i in range(count)]
     name_section = sections[names]
     strings = data[name_section[4]:name_section[4] + name_section[5]]
     ids = []
@@ -44,12 +45,15 @@ def elf_data(path):
             ids.append(raw[16:16 + descsz].hex())
         if section[1] not in [2, 11]:
             continue
-        if section[9] != 24 or len(raw) % 24 or section[6] >= len(sections):
+        if section[9] != (16 if is32 else 24) or len(raw) % (16 if is32 else 24) or section[6] >= len(sections):
             raise ValueError('invalid symbols')
         linked = sections[section[6]]
         strings_data = data[linked[4]:linked[4] + linked[5]]
-        for at in range(0, len(raw), 24):
-            nameoff, info, other, shndx, value, length = struct.unpack_from('<IBBHQQ', raw, at)
+        for at in range(0,len(raw),16 if is32 else 24):
+            if is32:
+                nameoff,value,length,info,other,shndx=struct.unpack_from('<IIIBBH',raw,at)
+            else:
+                nameoff,info,other,shndx,value,length=struct.unpack_from('<IBBHQQ',raw,at)
             if shndx == 0:
                 continue
             name = strings_data[nameoff:].split(b'\0', 1)[0].decode()
@@ -135,6 +139,10 @@ slot = gdb.lookup_type('struct dtv_slotinfo')
 slot_list = gdb.lookup_type('struct dtv_slotinfo_list')
 size_size = gdb.lookup_type('size_t').sizeof
 alignment = max(2 * size_size, gdb.lookup_type('long double').alignof)
+if size_size == 4:
+    alignment_source=pathlib.Path(os.environ['FASTDBG_ALIGNMENT_SOURCE']).read_bytes()
+    if not re.search(rb'^#define MALLOC_ALIGNMENT 16$',alignment_source,re.M):raise ValueError('unreviewed i386 alignment')
+    alignment=16
 minimum = (offset(chunk, 'fd_nextsize') + alignment - 1) & ~(alignment - 1)
 small_name = b'TCACHE_SMALL_BINS' if semantics['TcacheCounterMode'] == 'num_slots' else b'TCACHE_MAX_BINS'
 small_bins = re.findall(rb'^#\s*define\s+' + small_name + rb'\s+(\d+)\s*$', malloc_source, re.M)
@@ -167,13 +175,13 @@ else:
     symbols_wanted.append('tcache_shutting_down')
 profile = {
     'Schema': 1,
-    'Name': os.environ.get('FASTDBG_PROFILE_NAME', 'glibc-amd64-' + libc_id[:12]),
+    'Name': os.environ.get('FASTDBG_PROFILE_NAME', 'glibc-' + ('x86' if size_size==4 else 'amd64') + '-' + libc_id[:12]),
     'LibcBuildID': libc_id, 'LoaderBuildID': loader_id,
     'SourceRevision': os.environ.get('FASTDBG_SOURCE_REVISION', 'malloc-sha256-' + malloc_sha),
     'LibcDebugSHA256': libc_sha, 'LoaderDebugSHA256': loader_sha,
     'MallocSourceSHA256': malloc_sha,
     'ArenaSourceSHA256': arena_sha,
-    'Layout': {'schema': 1, 'allocator': 'glibc', 'arch': 'amd64', 'endian': 'little', 'pointer': 8,
+    'Layout': {'schema': 1, 'allocator': 'glibc', 'arch': 'x86' if size_size==4 else 'amd64', 'endian': 'little', 'pointer': size_size,
         'arena': record(arena, arena_fields),
         'chunk': record(chunk, ['mchunk_prev_size', 'mchunk_size', 'fd', 'bk', 'fd_nextsize', 'bk_nextsize']),
         'fast_link': 'safe-link-12' if source_model['Fastbins'] else '', 'tcache': record(cache, [semantics['TcacheCounterMode'], 'entries']),
@@ -184,8 +192,8 @@ profile = {
     'DummyInactiveOffset': inactive, 'DummyDisabledOffset': disabled,
     'Semantics': semantics,
     'Constants': {'Alignment': alignment, 'MinChunkSize': minimum, 'ChunkHeaderSize': 2 * size_size, 'SizeFlags': 1 | 2 | 4,
-        'HeapMaxSize': 2 * 4 * 1024 * 1024 * gdb.lookup_type('long').sizeof, 'TcacheSmallBinCount': int(small_bins[0]), 'TcacheLargeBinCount': int(large_bins[0]),
-        'SmallBinCount': int(small_normal[0]), 'NormalBinCount': int(normal_bins[0]), 'FastBinShift': 4 if source_model['Fastbins'] else 0},
+        'HeapMaxSize': (1024*1024 if size_size==4 else 2*4*1024*1024*gdb.lookup_type('long').sizeof), 'TcacheSmallBinCount': int(small_bins[0]), 'TcacheLargeBinCount': int(large_bins[0]),
+        'SmallBinCount': int(small_normal[0]), 'NormalBinCount': int(normal_bins[0]), 'FastBinShift': (3 if size_size==4 else 4) if source_model['Fastbins'] else 0},
     'TLS': {
         'ThreadSize': pthread.sizeof, 'TCBSize': tcb.sizeof,
         'ThreadSelfOffset': offset(tcb, 'self'), 'ThreadTCBOffset': offset(tcb, 'tcb'),

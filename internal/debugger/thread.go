@@ -226,7 +226,7 @@ func threadApplyReadOnly(name, rawArgs string) error {
 		switch command.name {
 		case "regs", "memory", "print", "x", "disassemble", "stack", "hexdump", "db", "dw", "dd", "dq", "backtrace", "stackframe", "arena", "bins":
 			return nil
-		case "vmmap", "proc-info", "fd", "sym", "got", "checksec", "stdio", "fs_base", "telescope", "simd", "xmm", "ymm", "search-string", "search-value", "findruction", "xxd", "chunk", "visual-heap":
+		case "vmmap", "proc-info", "fd", "sym", "got", "checksec", "stdio", "fs_base", "gs_base", "telescope", "simd", "xmm", "ymm", "search-string", "search-value", "findruction", "xxd", "chunk", "visual-heap":
 			return nil
 		case "wp":
 			if strings.TrimSpace(rawArgs) == "list" {

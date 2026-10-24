@@ -175,7 +175,7 @@ func (r Renderer) AddressPermissions(arch target.Architecture, address target.Ad
 }
 
 func (r Renderer) PermissionText(text string, read, write, execute bool) string {
-	code := "90"
+	code := ""
 	switch {
 	case read && write && execute:
 		code = "33"

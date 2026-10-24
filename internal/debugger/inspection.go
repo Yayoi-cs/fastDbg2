@@ -99,7 +99,11 @@ func (c *Controller) showPrint(ctx context.Context, format, rawArgs string) erro
 		return err
 	}
 	if format == "" {
-		return c.writef("HEX: 0x%x DEC: %d OCT: %o BIN: %b\n", value, value, value, value)
+		return c.writef("HEX: %s DEC: %s OCT: %s BIN: %s\n",
+			c.renderer.Text(display.StyleCyan, fmt.Sprintf("0x%x", value)),
+			c.renderer.Text(display.StyleCyan, fmt.Sprint(value)),
+			c.renderer.Text(display.StyleCyan, fmt.Sprintf("%o", value)),
+			c.renderer.Text(display.StyleCyan, fmt.Sprintf("%b", value)))
 	}
 	if format == "x" {
 		return c.writef("0x%x\n", value)
@@ -202,26 +206,13 @@ func (c *Controller) showInstructionRange(ctx context.Context, token target.Memo
 	if errors.Is(readErr, target.ErrStale) {
 		return readErr
 	}
-	instructions, decodeErr := inspect.Disassemble(target.AMD64, address, data, count)
+	instructions, decodeErr := inspect.Disassemble(c.abi().arch, address, data, count)
 	if len(instructions) < count && decodeErr == nil && readErr == nil {
 		decodeErr = fmt.Errorf("decoded %d of %d requested instructions: %w", len(instructions), count, io.ErrUnexpectedEOF)
 	}
-	view := contextOutput{writef: c.writef, renderer: c.renderer, width: display.OutputWidth(c.out)}
+	view := contextOutput{arch: c.abi().arch, writef: c.writef, renderer: c.renderer, width: display.OutputWidth(c.out)}
 	if err := view.heading("disassembly"); err != nil {
 		return err
-	}
-	if showLocation && location != nil {
-		rawPC, err := c.renderer.Address(target.AMD64, location.RawPC, display.AddressCode)
-		if err != nil {
-			return err
-		}
-		instructionPC, err := c.renderer.Address(target.AMD64, location.InstructionPC, display.AddressCode)
-		if err != nil {
-			return err
-		}
-		if err := c.writef("raw-pc=%s instruction-pc=%s\n", rawPC, instructionPC); err != nil {
-			return err
-		}
 	}
 	if err := c.instructionRows(instructions, location); err != nil {
 		return err
@@ -236,7 +227,8 @@ func (c *Controller) instructionRows(instructions []inspect.Instruction, locatio
 	}
 	width := display.OutputWidth(c.out)
 	for _, instruction := range instructions {
-		address, err := c.renderer.Address(target.AMD64, instruction.Address, display.AddressCode)
+		address, err := (display.Renderer{}).Address(c.abi().arch, instruction.Address, display.AddressUnknown)
+		address = c.renderer.Text(display.StyleBlue, address)
 		if err != nil {
 			return err
 		}
@@ -244,7 +236,7 @@ func (c *Controller) instructionRows(instructions []inspect.Instruction, locatio
 		if location != nil && instruction.Address == location.InstructionPC {
 			marker = c.renderer.Text(display.StyleCurrent, "=>")
 		}
-		line := fmt.Sprintf("%s %s  %-*x  %s\n", marker, address, byteWidth, instruction.Bytes, contextEscapedText(instruction.Text))
+		line := fmt.Sprintf("%s %s  %-*x  %s\n", marker, address, byteWidth, instruction.Bytes, c.renderer.Text(display.StylePurple, contextEscapedText(instruction.Text)))
 		if err := c.writef("%s", display.Wrap(line, width, 4)); err != nil {
 			return err
 		}
@@ -259,8 +251,8 @@ func (c *Controller) showStack(ctx context.Context, rawArgs string) error {
 	count := contextStackBytes / 8
 	if strings.TrimSpace(rawArgs) != "" {
 		value, err := positiveInt(rawArgs, "stack count")
-		if err != nil || value > maxMemoryBytes/8 {
-			return fmt.Errorf("stack count must be between 1 and %d: %w", maxMemoryBytes/8, target.ErrInvalidArgument)
+		if err != nil || value > maxMemoryBytes/c.abi().word {
+			return fmt.Errorf("stack count must be between 1 and %d: %w", maxMemoryBytes/c.abi().word, target.ErrInvalidArgument)
 		}
 		count = value
 	}
@@ -275,12 +267,12 @@ func (c *Controller) showStack(ctx context.Context, rawArgs string) error {
 	if err != nil {
 		return err
 	}
-	sp, err := contextRegisterValue(registers, "rsp")
+	sp, err := contextRegisterValue(registers, c.abi().sp)
 	if err != nil {
 		return err
 	}
 	address := target.Address(sp)
-	if err := inspectionRange(address, count*8); err != nil {
+	if err := inspectionRange(address, count*c.abi().word); err != nil {
 		return err
 	}
 	walker, viewErr := c.newAddressView(ctx, snapshot, thread, registers)
@@ -303,17 +295,17 @@ func (c *Controller) showStack(ctx context.Context, rawArgs string) error {
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	data := make([]byte, count*8)
+	data := make([]byte, count*c.abi().word)
 	n, readErr := c.session.ReadSpaceMemory(snapshot.Memory, address, data)
 	data, readErr = inspectionConfirmedBytes(data, n, readErr)
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	view := contextOutput{writef: c.writef, renderer: c.renderer}
+	view := contextOutput{arch: c.abi().arch, writef: c.writef, renderer: c.renderer}
 	if err := view.heading("stack"); err != nil {
 		return err
 	}
-	if err := view.rawMemory(address, data, 8, display.AddressStack, true); err != nil {
+	if err := view.rawMemory(address, data, c.abi().word, display.AddressStack, true); err != nil {
 		return err
 	}
 	return readErr
@@ -372,7 +364,7 @@ func (c *Controller) showHexdump(ctx context.Context, unit, rawArgs string) erro
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	view := contextOutput{writef: c.writef, renderer: c.renderer, width: display.OutputWidth(c.out)}
+	view := contextOutput{arch: c.abi().arch, writef: c.writef, renderer: c.renderer, width: display.OutputWidth(c.out)}
 	if err := view.heading("memory"); err != nil {
 		return err
 	}
@@ -391,7 +383,8 @@ func (c *Controller) hexRows(address target.Address, data []byte, unit int) erro
 	rowBytes := units * unit
 	for offset := 0; offset < len(data); offset += rowBytes {
 		row := data[offset:min(offset+rowBytes, len(data))]
-		addressText, err := c.renderer.Address(target.AMD64, address+target.Address(offset), display.AddressUnknown)
+		addressText, err := (display.Renderer{}).Address(c.abi().arch, address+target.Address(offset), display.AddressUnknown)
+		addressText = c.renderer.Text(display.StyleBlue, addressText)
 		if err != nil {
 			return err
 		}
@@ -405,7 +398,7 @@ func (c *Controller) hexRows(address target.Address, data []byte, unit int) erro
 			if unit == 1 {
 				values = append(values, fmt.Sprintf("%02x", part[0]))
 			} else {
-				values = append(values, fmt.Sprintf("0x%0*x", unit*2, inspectionWord(part)))
+				values = append(values, c.renderer.Text(display.StyleCyan, fmt.Sprintf("0x%0*x", unit*2, inspectionWord(part))))
 			}
 		}
 		width := units*(unit*2+3) - 1
@@ -419,7 +412,7 @@ func (c *Controller) hexRows(address target.Address, data []byte, unit int) erro
 				ascii[i] = value
 			}
 		}
-		if err := c.writef("%s: %-*s |%s|\n", addressText, width, strings.Join(values, " "), ascii); err != nil {
+		if err := c.writef("%s: %s |%s|\n", addressText, display.Pad(strings.Join(values, " "), width), ascii); err != nil {
 			return err
 		}
 	}

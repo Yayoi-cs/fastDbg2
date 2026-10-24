@@ -31,6 +31,7 @@ type unwindCommandSeed struct {
 	location    native.CodeLocation
 	profile     inspect.AMD64UnwindProfile
 	abiExplicit bool
+	orc         bool
 	symbols     []inspect.Symbol
 	symbolKey   uiSymbolCacheKey
 	symbolErr   error
@@ -101,11 +102,11 @@ func (c *Controller) readUnwindSeed(ctx context.Context) (unwindCommandSeed, err
 	if err != nil {
 		return unwindCommandSeed{}, err
 	}
-	decoded, err := inspect.AMD64UnwindRegistersFromTarget(registers)
+	decoded, err := inspect.UnwindRegistersFromTarget(snapshot.Architecture, registers)
 	if err != nil {
 		return unwindCommandSeed{}, err
 	}
-	rawPC, err := contextRegisterValue(registers, "rip")
+	rawPC, err := contextRegisterValue(registers, abiFor(snapshot.Architecture).pc)
 	if err != nil {
 		return unwindCommandSeed{}, err
 	}
@@ -138,6 +139,12 @@ func (c *Controller) collectUnwind(ctx context.Context, limit int, profile inspe
 	if err != nil {
 		return seed, inspect.UnwindResult{}, err
 	}
+	if _, ok := c.session.(*qemuSession); ok {
+		return c.collectKernelUnwind(ctx, seed, limit, profile)
+	}
+	if seed.snapshot.Architecture == target.X86 && profile == inspect.UnwindSysVAMD64 {
+		profile = inspect.UnwindSysVX86
+	}
 	seed.profile = profile
 	var result inspect.UnwindResult
 	var walkErr error
@@ -163,7 +170,7 @@ func (c *Controller) collectUnwind(ctx context.Context, limit int, profile inspe
 			if discoveryErr == nil {
 				discoveryErr = target.ErrUnavailable
 			}
-			result, walkErr = inspect.UnwindAMD64(ctx, inspect.AMD64UnwindRequest{
+			result, walkErr = inspect.Unwind(ctx, inspect.UnwindRequest{
 				Registers: seed.registers, PC: seed.location.InstructionPC, MaxFrames: limit, Profile: profile,
 				Find: func(context.Context, target.Address) (*inspect.CFIFrame, error) { return nil, discoveryErr },
 			})
@@ -172,7 +179,7 @@ func (c *Controller) collectUnwind(ctx context.Context, limit int, profile inspe
 		defer view.Memory.close()
 		seed.modules = slices.Clone(view.Modules)
 		finder := unwindCFIFinder{proc: proc, view: view, discovery: discoveryErr, cache: make(map[*runtimeELFModule]unwindCFICache)}
-		result, walkErr = inspect.UnwindAMD64(ctx, inspect.AMD64UnwindRequest{
+		result, walkErr = inspect.Unwind(ctx, inspect.UnwindRequest{
 			Registers: seed.registers, PC: seed.location.InstructionPC, MaxFrames: limit, Profile: profile,
 			Find: finder.find, Read: view.Memory.Read,
 		})
@@ -288,7 +295,7 @@ func (finder *unwindCFIFinder) load(ctx context.Context, module *runtimeELFModul
 		if err != nil || !contains {
 			return nil, errors.Join(fmt.Errorf("EH frame header is outside module PT_LOAD bounds: %w", target.ErrInvalidArgument), err)
 		}
-		return inspect.ReadCFIHeader(ctx, module.EHFrameHeader.Address, module.EHFrameHeader.Size, source+" runtime .eh_frame_hdr", metadataRead)
+		return inspect.ReadCFIHeader(ctx, module.EHFrameHeader.Address, module.EHFrameHeader.Size, source+" runtime .eh_frame_hdr", metadataRead, abiFor(module.Architecture).word)
 	}
 	file, err := openRuntimeMappedELF(finder.proc, module)
 	if err != nil {
@@ -317,7 +324,7 @@ func (finder *unwindCFIFinder) load(ctx context.Context, module *runtimeELFModul
 			}
 			return nil, readErr
 		}
-		return inspect.ParseCFISection(ctx, inspect.CFISection{Kind: inspect.CFIEHFrame, Address: address, Data: data, Source: source + " runtime .eh_frame via " + file.Proof}, metadataRead)
+		return inspect.ParseCFISection(ctx, inspect.CFISection{AddressSize: abiFor(module.Architecture).word, Kind: inspect.CFIEHFrame, Address: address, Data: data, Source: source + " runtime .eh_frame via " + file.Proof}, metadataRead)
 	}
 	section := file.File.Section(".debug_frame")
 	if section == nil || section.Size == 0 {
@@ -337,7 +344,7 @@ func (finder *unwindCFIFinder) load(ctx context.Context, module *runtimeELFModul
 		return nil, fmt.Errorf(".debug_frame section size differs from confirmed data: %w", target.ErrInvalidArgument)
 	}
 	return inspect.ParseCFISection(ctx, inspect.CFISection{
-		Kind: inspect.CFIDebugFrame, Address: target.Address(section.Addr), Data: data,
+		AddressSize: abiFor(module.Architecture).word, Kind: inspect.CFIDebugFrame, Address: target.Address(section.Addr), Data: data,
 		LoadBias: module.LoadBias, Source: source + " file .debug_frame via " + file.Proof,
 	}, metadataRead)
 }
@@ -409,16 +416,17 @@ type unwindUILabelKey struct {
 }
 
 type unwindUIView struct {
+	arch     target.Architecture
 	renderer display.Renderer
 	width    int
 	symbols  []inspect.Symbol
 	ends     []target.Address
 	modules  []*runtimeELFModule
-	labels   map[unwindUILabelKey][]string
+	labels   map[unwindUILabelKey]string
 }
 
 func (c *Controller) newUnwindUIView(seed unwindCommandSeed) unwindUIView {
-	view := unwindUIView{renderer: c.renderer, width: display.OutputWidth(c.out), labels: make(map[unwindUILabelKey][]string), modules: seed.modules}
+	view := unwindUIView{arch: seed.snapshot.Architecture, renderer: c.renderer, width: display.OutputWidth(c.out), labels: make(map[unwindUILabelKey]string), modules: seed.modules}
 	symbols := seed.symbols
 	if seed.symbolKey != newUISymbolCacheKey(seed.snapshot, seed.thread) {
 		symbols = nil
@@ -458,17 +466,17 @@ func (view unwindUIView) section(output *strings.Builder, name string) {
 }
 
 func (view unwindUIView) address(address target.Address) string {
-	text, _ := view.renderer.Address(target.AMD64, address, display.AddressUnknown)
+	text, _ := view.renderer.Address(abiFor(view.arch).arch, address, display.AddressUnknown)
 	return text
 }
 
-func (view unwindUIView) symbolLabels(frame inspect.UnwindFrame) []string {
+func (view unwindUIView) symbol(frame inspect.UnwindFrame) string {
 	key := unwindUILabelKey{frame.PC, frame.LookupPC, frame.ReturnPC}
 	if label, exists := view.labels[key]; exists {
 		return label
 	}
-	var labels []string
-	seen := make(map[string]bool)
+	var best string
+	var bestExact bool
 	end := sort.Search(len(view.symbols), func(i int) bool { return view.symbols[i].Address > frame.LookupPC })
 	for i := end - 1; i >= 0 && view.ends[i] >= frame.LookupPC; i-- {
 		symbol := view.symbols[i]
@@ -479,48 +487,13 @@ func (view unwindUIView) symbolLabels(frame inspect.UnwindFrame) []string {
 		if offset := uint64(frame.PC - symbol.Address); offset != 0 {
 			label += fmt.Sprintf("+0x%x", offset)
 		}
-		if !seen[label] {
-			seen[label] = true
-			labels = append(labels, label)
+		exact := frame.LookupPC == symbol.Address
+		if best == "" || exact && !bestExact || exact == bestExact && uiCompareSymbolLabels(label, best) < 0 {
+			best, bestExact = label, exact
 		}
 	}
-	slices.SortFunc(labels, uiCompareSymbolLabels)
-	view.labels[key] = labels
-	return labels
-}
-
-func (view unwindUIView) symbol(frame inspect.UnwindFrame) string {
-	return strings.Join(view.symbolLabels(frame), " | ")
-}
-
-func unwindUIAliases(labels []string, available int) string {
-	if len(labels) == 0 {
-		return ""
-	}
-	text := contextEscapedText(labels[0])
-	if display.VisibleWidth(text) > available {
-		return unwindUIElide(text, available)
-	}
-	for i := 1; i < len(labels); i++ {
-		candidate := text + " | " + contextEscapedText(labels[i])
-		marker := ""
-		if i+1 < len(labels) {
-			marker = fmt.Sprintf(" | +%d aliases", len(labels)-i-1)
-		}
-		if display.VisibleWidth(candidate+marker) > available {
-			marker = fmt.Sprintf(" | +%d aliases", len(labels)-i)
-			if display.VisibleWidth(text+marker) <= available {
-				return text + marker
-			}
-			marker = fmt.Sprintf(" (+%d)", len(labels)-i)
-			if display.VisibleWidth(text+marker) <= available {
-				return text + marker
-			}
-			return text
-		}
-		text = candidate
-	}
-	return text
+	view.labels[key] = best
+	return best
 }
 
 func (view unwindUIView) frameModule(frame inspect.UnwindFrame) (*runtimeELFModule, bool) {
@@ -595,7 +568,7 @@ func (view unwindUIView) frame(output *strings.Builder, frame inspect.UnwindFram
 	if index == 0 {
 		marker, style = "[*#0]", display.StyleCurrent
 	}
-	line := view.renderer.Text(style, marker) + " " + view.address(frame.PC)
+	line := view.renderer.Text(style, marker) + " " + view.renderer.Text(display.StylePurple, view.address(frame.PC))
 	suffix := ""
 	if frame.Signal {
 		suffix = " [signal]"
@@ -603,16 +576,15 @@ func (view unwindUIView) frame(output *strings.Builder, frame inspect.UnwindFram
 	if module := view.module(frame); module != "" {
 		suffix += " [" + contextEscapedText(module) + "]"
 	}
-	labels := view.symbolLabels(frame)
-	if len(labels) == 0 {
-		if offset := view.moduleOffset(frame); offset != "" {
-			labels = []string{offset}
-		}
+
+	label := view.symbol(frame)
+	if label == "" {
+		label = view.moduleOffset(frame)
 	}
-	if len(labels) != 0 {
+	if label != "" {
 		available := view.width - display.VisibleWidth(line) - display.VisibleWidth(suffix) - 3
 		if available >= 3 {
-			label := unwindUIAliases(labels, available)
+			label = unwindUIElide(contextEscapedText(label), available)
 			line += " " + view.renderer.Text(display.StyleSymbol, "<"+label+">")
 		}
 	}
@@ -627,18 +599,17 @@ func (view unwindUIView) identity(output *strings.Builder, seed unwindCommandSee
 	if seed.thread.TID > 0 {
 		thread += fmt.Sprintf(" (tid %d)", seed.thread.TID)
 	}
-	profile := unwindProfileName(seed.profile)
-	if seed.abiExplicit {
-		profile += " (explicit)"
-	} else if seed.profile == inspect.UnwindSysVAMD64 {
-		profile += " (native default)"
+	if seed.abiExplicit && seed.orc {
+		thread += " | Unwinder: ORC"
+	} else if seed.abiExplicit {
+		thread += " | ABI: " + unwindProfileName(seed.profile) + " (explicit)"
 	}
-	view.line(output, view.renderer.Text(display.StyleMuted, thread+" | ABI: "+profile))
+	view.line(output, thread)
 }
 
 func (view unwindUIView) breakpointNote(output *strings.Builder, seed unwindCommandSeed) {
 	if seed.location.Breakpoint != nil && seed.location.RawPC != seed.location.InstructionPC {
-		view.line(output, view.renderer.Text(display.StyleMuted, "Raw RIP: "+view.address(seed.location.RawPC)+" (software breakpoint)."))
+		view.line(output, view.renderer.Text(display.StyleMuted, "Raw "+strings.ToUpper(abiFor(seed.snapshot.Architecture).pc)+": "+view.address(seed.location.RawPC)+" (software breakpoint)."))
 	}
 }
 
@@ -650,13 +621,12 @@ func (c *Controller) backtraceText(seed unwindCommandSeed, result inspect.Unwind
 	for index, frame := range result.Frames {
 		view.frame(&output, frame, index)
 	}
-	view.breakpointNote(&output, seed)
 	if seed.symbolErr != nil {
 		view.line(&output, view.renderer.Text(display.StyleMuted, "Symbols incomplete: "+contextEscapedText(seed.symbolErr.Error())))
 	}
 	summary := "Unwind incomplete: caller information unavailable."
 	if result.Complete {
-		summary = "End of stack (CFI return address undefined)."
+		return output.String()
 	} else if result.Limited {
 		summary = fmt.Sprintf("Unwind partial: frame limit reached (%d).", len(result.Frames))
 	}
@@ -668,6 +638,8 @@ func unwindProfileName(profile inspect.AMD64UnwindProfile) string {
 	switch profile {
 	case inspect.UnwindStrictCFI:
 		return "strict-cfi"
+	case inspect.UnwindSysVX86:
+		return "sysv-x86"
 	case inspect.UnwindSysVAMD64:
 		return "sysv-amd64"
 	default:
@@ -675,7 +647,14 @@ func unwindProfileName(profile inspect.AMD64UnwindProfile) string {
 	}
 }
 
-func unwindRegisterLabel(number uint64) string {
+func unwindRegisterLabel(number uint64, architectures ...target.Architecture) string {
+	if len(architectures) > 0 && architectures[0] == target.X86 {
+		names := []string{"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "eip"}
+		if number < uint64(len(names)) {
+			return "$" + names[number]
+		}
+		return fmt.Sprintf("DWARF #%d", number)
+	}
 	names := [...]string{"rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"}
 	if number < uint64(len(names)) {
 		return "$" + names[number]
@@ -683,7 +662,7 @@ func unwindRegisterLabel(number uint64) string {
 	return fmt.Sprintf("DWARF #%d", number)
 }
 
-func unwindUIRule(saved inspect.UnwindSavedRegister) string {
+func unwindUIRule(saved inspect.UnwindSavedRegister, architectures ...target.Architecture) string {
 	switch saved.Rule {
 	case "offset":
 		return fmt.Sprintf("memory CFA%+d", saved.Offset)
@@ -692,7 +671,7 @@ func unwindUIRule(saved inspect.UnwindSavedRegister) string {
 	case "same_value":
 		return "same value"
 	case "register":
-		return "register " + unwindRegisterLabel(saved.SourceRegister)
+		return "register " + unwindRegisterLabel(saved.SourceRegister, architectures...)
 	case "expression":
 		return "memory expression"
 	case "val_expression":
@@ -719,24 +698,31 @@ func (c *Controller) stackFrameText(seed unwindCommandSeed, frame inspect.Unwind
 	if frame.CFAKnown {
 		rule := "DWARF expression"
 		if !frame.CFAExpression {
-			rule = fmt.Sprintf("%s %+d", unwindRegisterLabel(frame.CFARegister), frame.CFAOffset)
+			rule = fmt.Sprintf("%s %+d", unwindRegisterLabel(frame.CFARegister, seed.snapshot.Architecture), frame.CFAOffset)
+		}
+		if frame.CFARule != "" {
+			rule = frame.CFARule
 		}
 		view.line(&output, "CFA: "+view.address(frame.CFA)+" ("+rule+")")
 	} else {
 		view.line(&output, "CFA: <unavailable>")
 	}
 	if frame.Start < frame.End {
-		view.line(&output, fmt.Sprintf("CFI record: %#x | code [%s, %s)", frame.FDE, view.address(frame.Start), view.address(frame.End)))
+		kind := "CFI"
+		if frame.MetadataKind != "" {
+			kind = frame.MetadataKind
+		}
+		view.line(&output, fmt.Sprintf("%s record: %#x | code [%s, %s)", kind, frame.FDE, view.address(frame.Start), view.address(frame.End)))
 	}
 	view.section(&output, "frame registers")
-	for number := 0; number < len(frame.Registers.Values); number += 2 {
+	for number := 0; number < unwindRegisterCount(seed.snapshot.Architecture); number += 2 {
 		var columns []string
-		for register := number; register < min(number+2, len(frame.Registers.Values)); register++ {
+		for register := number; register < min(number+2, unwindRegisterCount(seed.snapshot.Architecture)); register++ {
 			value := "<unavailable>"
 			if frame.Registers.Known&(1<<register) != 0 {
-				value = fmt.Sprintf("0x%016x", frame.Registers.Values[register])
+				value = fmt.Sprintf("0x%0*x", abiFor(seed.snapshot.Architecture).word*2, frame.Registers.Values[register])
 			}
-			name := view.renderer.Text(display.StyleRegister, unwindRegisterLabel(uint64(register)))
+			name := view.renderer.Text(display.StyleRegister, unwindRegisterLabel(uint64(register), seed.snapshot.Architecture))
 			columns = append(columns, display.Pad(name, 7)+value)
 		}
 		line := columns[0]
@@ -756,19 +742,26 @@ func (c *Controller) stackFrameText(seed unwindCommandSeed, frame inspect.Unwind
 		if saved.AddressKnown {
 			location = view.address(saved.Address)
 		} else if saved.Rule == "register" {
-			location = unwindRegisterLabel(saved.SourceRegister)
+			location = unwindRegisterLabel(saved.SourceRegister, seed.snapshot.Architecture)
 		}
 		if saved.Available {
-			value = fmt.Sprintf("0x%016x", saved.Value)
+			value = fmt.Sprintf("0x%0*x", abiFor(seed.snapshot.Architecture).word*2, saved.Value)
 		}
 		switch saved.Provenance {
 		case "cfi":
 			origin = "CFI"
-		case "abi:sysv-amd64":
+		case "abi:sysv-amd64", "abi:sysv-x86":
 			origin = "SysV"
 		}
-		name := view.renderer.Text(display.StyleRegister, unwindRegisterLabel(saved.Register))
-		view.line(&output, display.Pad(name, 9)+display.Pad(unwindUIRule(saved), 20)+display.Pad(location, 21)+display.Pad(value, 21)+origin)
+		name := view.renderer.Text(display.StyleRegister, unwindRegisterLabel(saved.Register, seed.snapshot.Architecture))
+		view.line(&output, display.Pad(name, 9)+display.Pad(unwindUIRule(saved, seed.snapshot.Architecture), 20)+display.Pad(location, 21)+display.Pad(value, 21)+origin)
 	}
 	return output.String()
+}
+
+func unwindRegisterCount(arch target.Architecture) int {
+	if arch == target.X86 {
+		return 9
+	}
+	return 17
 }

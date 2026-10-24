@@ -35,7 +35,7 @@ func TestELFRuntimeAdapterDoesNotInventFileOrStaticMetadata(t *testing.T) {
 	if err := controller.printELFSecurity(module.Path, facts); err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"Runtime", "SYMTAB     : unknown (runtime dynamic metadata only)", "no PT_GNU_STACK"} {
+	for _, text := range []string{"Runtime", "Stripped   : Unknown", "no PT_GNU_STACK"} {
 		if !strings.Contains(output.String(), text) {
 			t.Fatalf("missing %q: %q", text, output.String())
 		}

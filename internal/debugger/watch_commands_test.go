@@ -313,9 +313,9 @@ func TestWatchpointStopDisplaysOnlyExactHitAndIndependentStepFacts(t *testing.T)
 	for _, expected := range []string{
 		fmt.Sprintf("Thread #2 (TID %d) stopped (hardware watchpoint).", peer.TID),
 		"  Instruction step completed.",
-		"  Watchpoint: thread #2, slot 3, generation 17; write 4 byte(s) at 0x0000000000405010 (session 1).",
-		"  Watchpoint: thread #2, slot 1, generation 19; read-write 1 byte(s) at 0x0000000000405011 (session 1).",
-		"  Hardware breakpoint: thread #2, slot 2, generation 23; execution at 0x0000000000401000 (session 1).",
+		"  Watchpoint: thread #2, slot 3; write 4 byte(s) at 0x0000000000405010.",
+		"  Watchpoint: thread #2, slot 1; read-write 1 byte(s) at 0x0000000000405011.",
+		"  Hardware breakpoint: thread #2, slot 2; execution at 0x0000000000401000.",
 	} {
 		if !uiOutputHasLine(output.String(), expected) {
 			t.Fatalf("missing %q in %q", expected, output.String())

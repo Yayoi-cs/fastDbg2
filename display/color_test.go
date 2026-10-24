@@ -74,9 +74,9 @@ func TestRendererTextStyles(t *testing.T) {
 		want  string
 	}{
 		{display.StylePlain, "text"},
-		{display.StyleHeading, "\x1b[1mtext\x1b[0m"},
+		{display.StyleHeading, "text"},
 		{display.StyleError, "\x1b[31mtext\x1b[0m"},
-		{display.StyleMuted, "\x1b[2mtext\x1b[0m"},
+		{display.StyleMuted, "text"},
 		{display.Style(255), "text"},
 	} {
 		if got := renderer.Text(test.style, "text"); got != test.want {
@@ -108,7 +108,7 @@ func TestRendererTextPreservesTrustedInput(t *testing.T) {
 	if got := renderer.Text(display.StylePlain, input); got != input {
 		t.Fatalf("plain text changed: %q", got)
 	}
-	if got := renderer.Text(display.StyleHeading, input); got != "\x1b[1m"+input+"\x1b[0m" {
+	if got := renderer.Text(display.StyleHeading, input); got != input {
 		t.Fatalf("styled text changed: %q", got)
 	}
 	var plain display.Renderer

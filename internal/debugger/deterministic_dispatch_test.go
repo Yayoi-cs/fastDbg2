@@ -171,8 +171,8 @@ func TestDeterministicHeapHelpSeparatesDeclaredLayoutAndProof(t *testing.T) {
 		command string
 		want    []string
 	}{
-		{"ARENAS", []string{"--layout-file FILE", "--module EXACT", "--fast-link plain|safe-link-12", "schema 1", "not allocator-identity proof", "GNU build-ID", "256 arenas", "4096 nodes", "1 MiB", "No automatic libc/arena/tcache discovery"}},
-		{"BINS", []string{"tcache is not inspected", "never inferred", "sentinel", "not claims of corruption or free-state", "--all is only supported by arena", "No heap/allocator discovery"}},
+		{"ARENAS", []string{"--layout-file FILE", "--module EXACT", "--fast-link plain|safe-link-12", "With no arguments", "--all", "-a EXPR", "-n"}},
+		{"BINS", []string{"selected thread's tcache", "--all", "-v", "-n", "--layout-file"}},
 	} {
 		var output bytes.Buffer
 		c := New(&output, display.Renderer{})
@@ -191,7 +191,7 @@ func TestDeterministicMetadataHelpDistinguishesIdentityAndAssociation(t *testing
 		c := New(&output, display.Renderer{})
 		executeController(t, c, "help", name)
 		for _, wanted := range []string{
-			"scope, proof and metadata source", "proc-exe+auxv", "strict mapped-file identity",
+			"scope and metadata are verified", "proc-exe+auxv", "strict mapped-file identity",
 			"kernel-vma-build-id-metadata", "does not prove the same backing file or all contents",
 			"DT_DEBUG/link_map", "AT_SYSINFO_EHDR", "unavailable/partial errors", "stale/cancel discards results",
 		} {

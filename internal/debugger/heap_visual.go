@@ -3,7 +3,6 @@ package debugger
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -34,6 +33,7 @@ type heapVisualMembership struct {
 }
 
 type heapVisualObservation struct {
+	word    uint64
 	proof   string
 	extents []heapVisualExtentObservation
 	err     error
@@ -72,8 +72,8 @@ func validateHeapVisual(input heapGraphInput, extents []heapVisualExtent) error 
 		return err
 	}
 	for index, name := range []string{"mchunk_prev_size", "mchunk_size"} {
-		if input.layout.Chunk.Fields[name] != (inspect.HeapField{Offset: uint64(index * 8), Width: 8, Count: 1, Stride: 8}) {
-			return fmt.Errorf("visual-heap requires the proven amd64 16-byte chunk header; %s layout differs: %w", name, target.ErrUnsupported)
+		if input.layout.Chunk.Fields[name] != (inspect.HeapField{Offset: uint64(index) * input.layout.Pointer, Width: input.layout.Pointer, Count: 1, Stride: input.layout.Pointer}) {
+			return fmt.Errorf("visual-heap requires a %d-byte chunk header; %s layout differs: %w", 2*input.layout.Pointer, name, target.ErrUnsupported)
 		}
 	}
 	if len(extents) == 0 || len(extents) > heapGraphMaxArenas {
@@ -84,14 +84,14 @@ func validateHeapVisual(input heapGraphInput, extents []heapVisualExtent) error 
 		if err := contextReady(input.reader.ctx); err != nil {
 			return err
 		}
-		if extent.Base > extent.Start || extent.Start >= extent.End || uint64(extent.Start)%heapVisualAlignment != 0 || uint64(extent.End)%heapVisualAlignment != 0 {
+		if extent.Base > extent.Start || extent.Start >= extent.End || (uint64(extent.Start)+2*input.layout.Pointer)%heapVisualAlignment != 0 || uint64(extent.End)%heapVisualAlignment != 0 {
 			return fmt.Errorf("visual-heap needs Base <= Start < End and aligned chunk endpoints: %w", target.ErrInvalidArgument)
 		}
-		if extent.Top != 0 && (extent.Top < extent.Start || extent.Top >= extent.End || uint64(extent.Top)%heapVisualAlignment != 0) {
+		if extent.Top != 0 && (extent.Top < extent.Start || extent.Top >= extent.End || (uint64(extent.Top)+2*input.layout.Pointer)%heapVisualAlignment != 0) {
 			return fmt.Errorf("visual-heap TOP must be an aligned header within its proven extent: %w", target.ErrInvalidArgument)
 		}
-		if extent.TerminalFencepost != 0 && (extent.Top != 0 || extent.Arena == 0 || extent.End-extent.Start < 32 || extent.TerminalFencepost != extent.End-16) {
-			return fmt.Errorf("visual-heap terminal fencepost requires an older proven heap_info extent with a final 16-byte header: %w", target.ErrInvalidArgument)
+		if extent.TerminalFencepost != 0 && (extent.Top != 0 || extent.Arena == 0 || uint64(extent.End-extent.Start) < 4*input.layout.Pointer || extent.TerminalFencepost != extent.End-target.Address(2*input.layout.Pointer)) {
+			return fmt.Errorf("visual-heap terminal fencepost requires an older proven heap_info extent with a final %d-byte header: %w", 2*input.layout.Pointer, target.ErrInvalidArgument)
 		}
 	}
 	var followingTop bool
@@ -124,10 +124,13 @@ func validateHeapVisual(input heapGraphInput, extents []heapVisualExtent) error 
 }
 
 func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members map[target.Address][]heapVisualMembership) (heapVisualObservation, error) {
+	word := input.layout.Pointer
+	headerSize := word * 2
 	var result heapVisualObservation
 	if err := validateHeapVisual(input, extents); err != nil {
 		return result, err
 	}
+	result.word = word
 	result.proof = input.proof
 	result.extents = make([]heapVisualExtentObservation, len(extents))
 	for index, extent := range extents {
@@ -147,7 +150,7 @@ func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members
 			if err := input.reader.takeNode(); err != nil {
 				return finish(err)
 			}
-			data, err := input.reader.read(address, heapVisualHeaderSize)
+			data, err := input.reader.read(address, headerSize)
 			if heapGraphFatal(err) {
 				return finish(err)
 			}
@@ -156,7 +159,7 @@ func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members
 				top: extent.Top != 0 && address == extent.Top, members: slices.Clone(members[address]), err: err,
 			})
 			chunk := &view.chunks[len(view.chunks)-1]
-			if err != nil || len(data) != heapVisualHeaderSize {
+			if err != nil || uint64(len(data)) != headerSize {
 				if err == nil {
 					err = fmt.Errorf("visual-heap header at %#x is incomplete: %w", address, target.ErrPartial)
 					chunk.err = err
@@ -166,7 +169,7 @@ func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members
 			chunk.decoded = true
 			chunk.ordinal = ordinal
 			ordinal++
-			chunk.rawSize = binary.LittleEndian.Uint64(data[8:])
+			chunk.rawSize = inspectionWord(data[word:])
 			chunk.size = chunk.rawSize &^ 7
 			if len(view.chunks) > 1 {
 				view.chunks[len(view.chunks)-2].nextInUse = int8(chunk.rawSize & 1)
@@ -176,8 +179,8 @@ func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members
 				valid := false
 				if len(view.chunks) > 1 {
 					previous := &view.chunks[len(view.chunks)-2]
-					footer := binary.LittleEndian.Uint64(data[:8])
-					valid = chunk.rawSize == 1 && (footer == 16 || footer == 32) && previous.size == footer && previous.rawSize&^1 == footer && address-previous.address == target.Address(footer)
+					footer := inspectionWord(data[:word])
+					valid = chunk.rawSize == 1 && (footer == headerSize || footer == 4*word) && previous.size == footer && previous.rawSize&^1 == footer && address-previous.address == target.Address(footer)
 					if valid {
 						previous.fencepost, previous.validatedTail = true, true
 					}
@@ -190,17 +193,17 @@ func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members
 				view.end, view.complete = extent.End, true
 				break
 			}
-			if !chunk.top && chunk.rawSize&^1 == heapVisualHeaderSize {
+			if !chunk.top && chunk.rawSize&^1 == headerSize {
 				chunk.fencepost = true
-				if extent.TerminalFencepost != 0 && address+heapVisualHeaderSize == extent.TerminalFencepost {
-					address += heapVisualHeaderSize
+				if extent.TerminalFencepost != 0 && address+target.Address(headerSize) == extent.TerminalFencepost {
+					address += target.Address(headerSize)
 					view.end = address
 					continue
 				}
 				chunk.err = fmt.Errorf("fencepost-sized boundary at %#x; the remaining extent is not proven and may contain a foreign sbrk gap; traversal stops here: %w", address, target.ErrUnavailable)
 				return finish(chunk.err)
 			}
-			if chunk.size < heapVisualMinChunk || chunk.size%heapVisualAlignment != 0 || chunk.rawSize&2 != 0 {
+			if chunk.size < 4*word || (!chunk.top && chunk.size%heapVisualAlignment != 0 || chunk.top && (chunk.size+headerSize)%heapVisualAlignment != 0) || chunk.rawSize&2 != 0 {
 				chunk.err = fmt.Errorf("inconsistent arena chunk header at %#x: size=%#x IS_MMAPPED=%d; observation may intersect an allocator update: %w", address, chunk.size, chunk.rawSize>>1&1, target.ErrInvalidState)
 				return finish(chunk.err)
 			}
@@ -213,17 +216,17 @@ func collectHeapVisual(input heapGraphInput, extents []heapVisualExtent, members
 				chunk.err = fmt.Errorf("chunk at %#x ends at %#x beyond its proven boundary; observation may intersect an allocator update: %w", address, next, target.ErrInvalidState)
 				return finish(chunk.err)
 			}
-			chunk.requestedPayload = chunk.size - heapVisualHeaderSize
+			chunk.requestedPayload = chunk.size - headerSize
 			payloadSize := chunk.requestedPayload
-			if _, cached := input.reader.cache[heapGraphReadKey{address + heapVisualHeaderSize, payloadSize}]; !cached {
+			if _, cached := input.reader.cache[heapGraphReadKey{address + target.Address(headerSize), payloadSize}]; !cached {
 				payloadSize = min(payloadSize, heapGraphMaxBytes-input.reader.bytes)
 			}
 			if payloadSize != 0 {
-				chunk.payload, chunk.err = input.reader.read(address+heapVisualHeaderSize, payloadSize)
+				chunk.payload, chunk.err = input.reader.read(address+target.Address(headerSize), payloadSize)
 			}
 			if payloadSize < chunk.requestedPayload {
 				input.reader.exhausted = true
-				chunk.err = errors.Join(chunk.err, fmt.Errorf("visual-heap payload at %#x exceeds the remaining global %d-byte read budget: %w", address+heapVisualHeaderSize, heapGraphMaxBytes, target.ErrUnavailable))
+				chunk.err = errors.Join(chunk.err, fmt.Errorf("visual-heap payload at %#x exceeds the remaining global %d-byte read budget: %w", address+target.Address(headerSize), heapGraphMaxBytes, target.ErrUnavailable))
 			}
 			if chunk.err != nil {
 				return finish(chunk.err)
@@ -255,26 +258,31 @@ func renderHeapVisual(ctx context.Context, observation heapVisualObservation, re
 	if len(observation.extents) == 0 {
 		return "", nil
 	}
+	word := observation.word
+	if word == 0 {
+		word = 8
+	}
 	var output strings.Builder
-	fmt.Fprintf(&output, "%s\n", renderer.Text(display.StyleHeading, "[visual-heap]"))
-	for index, view := range observation.extents {
+	for _, view := range observation.extents {
 		if err := contextReady(ctx); err != nil {
 			return "", err
 		}
 		extent := view.extent
-		fmt.Fprintf(&output, "heap[%d] arena=0x%016x range=[0x%016x, 0x%016x) TOP=0x%016x\n", index, extent.Arena, extent.Start, extent.End, extent.Top)
-		output.WriteString("Address            | +Chunk  | +Heap   : Word[0]            Word[1]            | ASCII            | Facts\n")
 		for _, chunk := range view.chunks {
 			if err := contextReady(ctx); err != nil {
 				return "", err
 			}
-			label := heapVisualChunkLabel(chunk)
+			label := heapVisualChunkLabel(chunk, word)
 			style := heapVisualChunkStyle(chunk.ordinal)
-			if err := renderHeapVisualRows(ctx, &output, renderer, extent, chunk.address, 0, chunk.header, label, false, style); err != nil {
+			headerLabel := label
+			if len(chunk.payload) != 0 {
+				headerLabel = ""
+			}
+			if err := renderHeapVisualRows(ctx, &output, renderer, extent, chunk.address, 0, chunk.header, headerLabel, false, style, int(word)); err != nil {
 				return "", err
 			}
 			if len(chunk.payload) > 0 {
-				if err := renderHeapVisualRows(ctx, &output, renderer, extent, chunk.address, heapVisualHeaderSize, chunk.payload, "", true, style); err != nil {
+				if err := renderHeapVisualRows(ctx, &output, renderer, extent, chunk.address, word*2, chunk.payload, label, true, style, int(word)); err != nil {
 					return "", err
 				}
 			}
@@ -287,24 +295,10 @@ func renderHeapVisual(ctx context.Context, observation heapVisualObservation, re
 				fmt.Fprintf(&output, "    %s\n", renderer.Text(display.StyleError, "<incomplete: "+strconv.QuoteToGraphic(chunk.err.Error())+">"))
 			}
 		}
-		fmt.Fprintf(&output, "heap[%d] headers=%d complete=%t\n", index, len(view.chunks), view.complete)
-		if view.end < extent.End {
-			if view.complete {
-				fmt.Fprintf(&output, "    <range [0x%016x, 0x%016x) is not traversed after declared TOP>\n", view.end, extent.End)
-			} else {
-				fmt.Fprintf(&output, "    <range [0x%016x, 0x%016x) is not fully inspected>\n", view.end, extent.End)
-			}
+		if !view.complete && view.end < extent.End {
+			fmt.Fprintf(&output, "    <range [0x%0*x, 0x%0*x) is not fully inspected>\n", word*2, view.end, word*2, extent.End)
 		}
 	}
-	for index, view := range observation.extents {
-		if err := contextReady(ctx); err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&output, "heap[%d] base=0x%016x %s\n", index, view.extent.Base, strconv.QuoteToGraphic(view.extent.Label))
-	}
-	fmt.Fprintf(&output, "provenance=%s\n", strconv.QuoteToGraphic(observation.proof))
-	fmt.Fprintf(&output, "header=%d payload-policy=full including TOP; global read budget=%d bytes\n", heapVisualHeaderSize, heapGraphMaxBytes)
-	output.WriteString("Membership labels identify observed list links; unlisted chunks are not classified as allocated.\n")
 	if observation.err != nil {
 		fmt.Fprintf(&output, "%s\n", renderer.Text(display.StyleError, "<visual-heap incomplete: "+strconv.QuoteToGraphic(observation.err.Error())+">"))
 	}
@@ -314,74 +308,67 @@ func renderHeapVisual(ctx context.Context, observation heapVisualObservation, re
 	return output.String(), nil
 }
 
-func heapVisualChunkLabel(chunk heapVisualChunkObservation) string {
-	if !chunk.decoded {
-		return fmt.Sprintf("<partial header: %d/%d bytes confirmed; not decoded>", len(chunk.header), heapVisualHeaderSize)
+func heapVisualChunkLabel(chunk heapVisualChunkObservation, words ...uint64) string {
+	header := uint64(heapVisualHeaderSize)
+	if len(words) > 0 {
+		header = 2 * words[0]
 	}
-	name := "chunk"
-	if chunk.top {
-		name = "TOP"
-	} else if chunk.terminal && chunk.validatedTail {
-		name = "validated heap_info terminal fencepost"
-	} else if chunk.terminal {
-		name = "unconfirmed heap_info terminal fencepost"
-	} else if chunk.fencepost && chunk.validatedTail {
-		name = "validated heap_info fencepost"
-	} else if chunk.fencepost {
-		name = "fencepost-sized boundary"
+	if !chunk.decoded {
+		return fmt.Sprintf("<partial header: %d/%d bytes confirmed; not decoded>", len(chunk.header), header)
 	}
 	var labels []string
-	if name != "chunk" || len(chunk.members) == 0 {
-		labels = append(labels, name)
+	if chunk.top {
+		labels = append(labels, "top")
+	} else if chunk.validatedTail {
+		labels = append(labels, "fencepost")
+	} else if chunk.fencepost || chunk.terminal {
+		labels = append(labels, "boundary")
 	}
 	for _, member := range chunk.members {
-		quoted := strconv.QuoteToGraphic(member.Label)
-		label := quoted[1 : len(quoted)-1]
+		label := contextEscapedText(member.Label)
 		if !member.Complete {
 			label += " (incomplete list)"
 		}
 		labels = append(labels, label)
 	}
-	label := fmt.Sprintf("%s size=0x%x P=%d M=%d A=%d", strings.Join(labels, "; "), chunk.size, chunk.rawSize&1, chunk.rawSize>>1&1, chunk.rawSize>>2&1)
-	if !chunk.top && !chunk.fencepost && !chunk.terminal && len(chunk.members) == 0 {
-		switch chunk.nextInUse {
-		case 0:
-			label += "; in-use bit clear (next.PREV_INUSE)"
-		case 1:
-			label += "; in-use bit set (next.PREV_INUSE)"
-		default:
-			label += "; in-use bit unavailable (next header not confirmed)"
-		}
-	}
-	return label
+	return strings.Join(labels, ", ")
 }
 
 func heapVisualChunkStyle(ordinal int) display.Style {
 	if ordinal < 0 {
 		return display.StyleMuted
 	}
-	return [...]display.Style{display.StyleChanged, display.StyleCurrent, display.StyleRegister, display.StyleString}[ordinal%4]
+	return [...]display.Style{display.StyleRed, display.StyleGreen, display.StyleYellow, display.StyleBlue, display.StylePurple, display.StyleCyan}[ordinal%6]
 }
 
-func renderHeapVisualRows(ctx context.Context, output *strings.Builder, renderer display.Renderer, extent heapVisualExtent, header target.Address, start uint64, data []byte, label string, compress bool, style display.Style) error {
-	for offset := 0; offset < len(data) || offset == 0 && len(data) == 0; offset += 16 {
+func renderHeapVisualRows(ctx context.Context, output *strings.Builder, renderer display.Renderer, extent heapVisualExtent, header target.Address, start uint64, data []byte, label string, compress bool, style display.Style, widths ...int) error {
+	size := 8
+	if len(widths) > 0 {
+		size = widths[0]
+	}
+	stride := size * 2
+	arch := target.AMD64
+	if size == 4 {
+		arch = target.X86
+	}
+	for offset := 0; offset < len(data) || offset == 0 && len(data) == 0; offset += stride {
 		if err := contextReady(ctx); err != nil {
 			return err
 		}
-		row := data[offset:min(offset+16, len(data))]
+		row := data[offset:min(offset+stride, len(data))]
 		address := header + target.Address(start) + target.Address(offset)
-		addressText, err := renderer.Address(target.AMD64, address, display.AddressUnknown)
+		addressText, err := renderer.Address(arch, address, display.AddressUnknown)
 		if err != nil {
 			return err
 		}
 		words := [2]string{}
 		for word := range words {
-			bytes := row[min(word*8, len(row)):min((word+1)*8, len(row))]
+			bytes := row[min(word*size, len(row)):min((word+1)*size, len(row))]
 			switch len(bytes) {
 			case 0:
 				words[word] = "<unavailable>"
-			case 8:
-				words[word] = fmt.Sprintf("0x%016x", binary.LittleEndian.Uint64(bytes))
+			case 4, 8:
+				words[word] = fmt.Sprintf("0x%0*x", size*2, inspectionWord(bytes))
 			default:
 				words[word] = "bytes[" + fmt.Sprintf("%x", bytes) + "]"
 			}
@@ -394,21 +381,24 @@ func renderHeapVisualRows(ctx context.Context, output *strings.Builder, renderer
 				ascii.WriteByte('.')
 			}
 		}
-		line := fmt.Sprintf("%s | +0x%04x | +0x%04x : %-18s %-18s | %-16s | %s", addressText, start+uint64(offset), uint64(address-extent.Base), words[0], words[1], ascii.String(), label)
+		line := fmt.Sprintf("%s|+0x%05x|+0x%05x: %-*s %-*s | %-*s |", addressText, start+uint64(offset), uint64(address-extent.Base), size*2+2, words[0], size*2+2, words[1], stride, ascii.String())
+		if label != "" {
+			line += " <- " + label
+		}
 		output.WriteString(renderer.Text(style, line) + "\n")
 		label = ""
-		if compress && len(row) == 16 {
-			end := offset + 16
-			for end+16 <= len(data) && bytes.Equal(row, data[end:end+16]) {
+		if compress && len(row) == stride {
+			end := offset + stride
+			for end+stride <= len(data) && bytes.Equal(row, data[end:end+stride]) {
 				if err := contextReady(ctx); err != nil {
 					return err
 				}
-				end += 16
+				end += stride
 			}
-			if end > offset+16 {
-				line := fmt.Sprintf("    * %d lines, 0x%x bytes", (end-offset)/16-1, end-offset-16)
+			if end > offset+stride {
+				line := fmt.Sprintf("    * %d lines, 0x%x bytes", (end-offset)/stride-1, end-offset-stride)
 				output.WriteString(renderer.Text(style, line) + "\n")
-				offset = end - 16
+				offset = end - stride
 			}
 		}
 	}

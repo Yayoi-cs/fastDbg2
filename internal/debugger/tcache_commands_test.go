@@ -39,7 +39,7 @@ func TestExplicitTcacheUsesActualNextFieldAndRawCounter(t *testing.T) {
 	binary.LittleEndian.PutUint64(entry[32:], 0x12345678)
 	heapGraphTestMemory(fixture, map[target.Address][]byte{0x1000: heapGraphTestArena(layout, 0x1000), 0x2000: root, 0xff0: entry})
 	err := controller.showBins(context.Background(), fmt.Sprintf("--layout-file %q --tcache '0x1000 + 0x1000' 0x1000", path))
-	if err != nil || !strings.Contains(output.String(), "num_slots.raw=60000 observed=1 complete=true") || !strings.Contains(output.String(), "next=0x0000000000000000 key.raw=0x0000000012345678") {
+	if err != nil || !strings.Contains(output.String(), "num_slots.raw=60000 count=1") || !strings.Contains(output.String(), "next=0x0000000000000000 key.raw=0x0000000012345678") {
 		t.Fatalf("error=%v output=%q", err, output.String())
 	}
 	if fixture.snapshotReads != 1 || len(fixture.stackCalls) != 3 || fixture.stackCalls[2] != (contextMemoryCall{fixture.snapshot.Memory, 0xff0, 40}) {

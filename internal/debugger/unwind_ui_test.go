@@ -83,14 +83,12 @@ func TestUnwindUICompactTraceUsesOnlyConfirmedFacts(t *testing.T) {
 	for _, expected := range []string{
 		"[trace]", "Thread 7 (tid 1234) | ABI: sysv-amd64 (explicit)",
 		"[*#0] 0x0000000000401000", "[ #1] 0x0000000000402008 [signal]",
-		"Raw RIP: 0x0000000000401001 (software breakpoint).",
-		"End of stack (CFI return address undefined).",
 	} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %q:\n%s", expected, text)
 		}
 	}
-	for _, forbidden := range []string{"lookup-pc=", "raw-rip=", "cfi-source=", "module=", "proof=", "0x00000000deadbeef", "\x1b"} {
+	for _, forbidden := range []string{"lookup-pc=", "raw-rip=", "cfi-source=", "module=", "proof=", "Raw RIP:", "End of stack", "0x00000000deadbeef", "\x1b"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("trace leaked machine diagnostics or unconfirmed values %q:\n%s", forbidden, text)
 		}
@@ -116,12 +114,11 @@ func TestUnwindUITraceSummaryDoesNotInventBottom(t *testing.T) {
 	}{
 		{false, false, "Unwind incomplete: caller information unavailable."},
 		{false, true, "Unwind partial: frame limit reached (2)."},
-		{true, false, "End of stack (CFI return address undefined)."},
+		{true, false, ""},
 	} {
 		result.Complete, result.Limited = test.complete, test.limited
 		text := controller.backtraceText(seed, result)
-		if !strings.Contains(text, "ABI: strict-cfi") || !strings.Contains(text, test.want) ||
-			strings.Count(text, test.want) != 1 || strings.Contains(text, "Raw RIP:") ||
+		if !strings.Contains(text, "ABI: strict-cfi") || (test.want != "" && strings.Count(text, test.want) != 1) || (test.complete && strings.Contains(text, "Unwind")) || strings.Contains(text, "Raw RIP:") ||
 			!test.complete && strings.Contains(text, "End of stack") {
 			t.Fatalf("summary changed certainty:\n%s", text)
 		}
@@ -177,8 +174,8 @@ func TestUnwindUICachedSymbolsAreExactSpaceBoundAndReadFree(t *testing.T) {
 		{Name: "alias", Info: byte(elf.STT_FUNC), Section: 1, Value: 0x1000, Size: 0x10},
 	})
 	result.Frames[0].PC, result.Frames[0].LookupPC = 0x401000, 0x401000
-	if text := controller.backtraceText(seed, result); !strings.Contains(text, "<leaf | alias>") {
-		t.Fatalf("lost exact alias candidates:\n%s", text)
+	if text := controller.backtraceText(seed, result); !strings.Contains(text, "<leaf>") {
+		t.Fatalf("single symbol label missing:\n%s", text)
 	}
 }
 
@@ -195,28 +192,27 @@ func TestUnwindUIReturnPCAtSymbolBoundaryDoesNotRelabelCaller(t *testing.T) {
 	}
 }
 
-func TestUnwindUICompactAliasPresentationDoesNotSelectControlSymbols(t *testing.T) {
+func TestUnwindUISingleSymbolPresentation(t *testing.T) {
 	controller, seed, result, _ := unwindUIFixture()
 	seed.symbols = []inspect.Symbol{
 		{ModuleID: "libc", Name: "__GI___libc_free", Type: elf.STT_FUNC, Section: 1, Address: 0x401000, AddressKnown: true, Size: 32},
 		{ModuleID: "libc", Name: "__libc_free", Type: elf.STT_FUNC, Section: 1, Address: 0x401000, AddressKnown: true, Size: 32},
 		{ModuleID: "libc", Name: "free", Version: "GLIBC_2.2.5", Type: elf.STT_FUNC, Section: 1, Address: 0x401000, AddressKnown: true, Size: 32},
-		{ModuleID: "libc", Name: "free", Type: elf.STT_FUNC, Section: 1, Address: 0x401000, AddressKnown: true, Size: 32},
+		{ModuleID: "libc", Name: "cfree", Type: elf.STT_FUNC, Section: 1, Address: 0x401000, AddressKnown: true, Size: 32},
 	}
 	seed.symbolKey = newUISymbolCacheKey(seed.snapshot, seed.thread)
 	view := controller.newUnwindUIView(seed)
-	labels := view.symbolLabels(result.Frames[0])
-	if len(labels) != 3 || labels[0] != "free" {
-		t.Fatalf("presentation labels=%v", labels)
+	if label := view.symbol(result.Frames[0]); label != "free" {
+		t.Fatalf("symbol=%q", label)
 	}
-	for _, width := range []int{25, 40, 80} {
-		label := unwindUIAliases(labels, width)
-		if !strings.HasPrefix(label, "free") || display.VisibleWidth(label) > width || strings.Contains(label, "...") {
-			t.Fatalf("width%d label=%q", width, label)
+	for _, width := range []int{40, 80, 120} {
+		view.width = width
+		var output strings.Builder
+		view.frame(&output, result.Frames[0], 0)
+		text := output.String()
+		if !strings.Contains(text, "<free>") || strings.Contains(text, "cfree") || strings.Contains(text, "aliases") || strings.Contains(text, " | ") {
+			t.Fatalf("width%d: %s", width, text)
 		}
-	}
-	if label := unwindUIAliases(labels, 25); !strings.Contains(label, "+2 aliases") {
-		t.Fatalf("alias count=%q", label)
 	}
 }
 

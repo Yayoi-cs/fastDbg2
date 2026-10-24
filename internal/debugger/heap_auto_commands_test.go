@@ -78,7 +78,7 @@ func TestGlibc244BinBoundariesAreSourceFormulas(t *testing.T) {
 func automaticHeapTestContext(t *testing.T) *allocatorContext {
 	t.Helper()
 	profiles, err := knownAllocatorProfiles()
-	if err != nil || len(profiles) != 1 {
+	if err != nil || len(profiles) != 2 {
 		t.Fatalf("profiles=%d error=%v", len(profiles), err)
 	}
 	profile := profiles[0]
@@ -136,10 +136,10 @@ func TestAutomaticTcacheChecksKnownSourceInvariantsWithoutGuessing(t *testing.T)
 				t.Fatalf("error=%v", err)
 			}
 			text, formatErr := formatAutomaticBins(context.Background(), observation, controller.renderer, false)
-			if formatErr != nil || !strings.Contains(text, "thread=9 TID=123") || !strings.Contains(text, "not present in this allocator build") {
+			if formatErr != nil || !strings.Contains(text, "Thread 9 (tid 123)") || !strings.Contains(text, "not present in this allocator build") {
 				t.Fatalf("format error=%v text=%q", formatErr, text)
 			}
-			if mode == "valid" && (!strings.Contains(text, "chunk=0x0000000000005000 size=0x20") || !strings.Contains(text, "num_slots.raw=15 observed=1 complete=true")) {
+			if mode == "valid" && (!strings.Contains(text, "chunk=0x0000000000005000 size=0x20") || !strings.Contains(text, "num_slots.raw=15 count=1")) {
 				t.Fatal(text)
 			}
 			if output.Len() != 0 {
@@ -218,7 +218,7 @@ func TestAutomaticOldCountsCapacityZeroKeepsAnActiveAllocatedCache(t *testing.T)
 				t.Fatalf("error=%v tcache=%+v reads=%v", err, observation.tcache, fixture.stackCalls)
 			}
 			text, err := formatAutomaticBins(context.Background(), observation, controller.renderer, true)
-			if err != nil || !strings.Contains(text, "counts.raw=0 observed=0 complete=true") || strings.Contains(text, "num_slots") || strings.Contains(text, "disabled") || strings.Contains(text, "tcache[idx=64") {
+			if err != nil || !strings.Contains(text, "counts.raw=0 count=0") || strings.Contains(text, "num_slots") || strings.Contains(text, "disabled") || strings.Contains(text, "tcache[idx=64") {
 				t.Fatalf("error=%v text=%q", err, text)
 			}
 		})

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -37,12 +36,14 @@ type addressWalkWord struct {
 }
 
 type addressWalker struct {
+	arch        target.Architecture
 	reader      addressWalkReader
 	memory      target.MemoryToken
 	maps        []procMap
 	mapErr      error
 	mapNotice   bool
 	renderer    display.Renderer
+	rowStyle    display.Style
 	labels      map[target.Address][]string
 	cache       map[target.Address]addressWalkWord
 	reads       int
@@ -56,7 +57,7 @@ type addressWalker struct {
 	textCalls   int
 }
 
-func newAddressWalker(reader addressWalkReader, memory target.MemoryToken, mappings []procMap, registers []target.Register, renderer display.Renderer) (*addressWalker, error) {
+func newAddressWalker(reader addressWalkReader, memory target.MemoryToken, mappings []procMap, registers []target.Register, renderer display.Renderer, architectures ...target.Architecture) (*addressWalker, error) {
 	if reader == nil || memory.Space.ID == 0 || memory.Space.Session == 0 || memory.Revision == 0 {
 		return nil, target.ErrInvalidArgument
 	}
@@ -70,16 +71,19 @@ func newAddressWalker(reader addressWalkReader, memory target.MemoryToken, mappi
 		labels: make(map[target.Address][]string), cache: make(map[target.Address]addressWalkWord), symbolCache: make(map[target.Address]string),
 		textCache: make(map[target.Address]string), textBytes: make(map[target.Address]byte), textFailed: make(map[target.Address]bool),
 	}
+	if len(architectures) > 0 {
+		walker.arch = architectures[0]
+	}
 	seen := make(map[string]bool)
 	for _, register := range registers {
-		if register.Name != "rsp" && register.Name != "rbp" {
+		if register.Name != walker.abi().sp && register.Name != walker.abi().bp {
 			continue
 		}
 		if seen[register.Name] {
 			return nil, fmt.Errorf("duplicate address label register %q: %w", register.Name, target.ErrAmbiguous)
 		}
 		seen[register.Name] = true
-		if !register.Available || register.Bits != 64 {
+		if !register.Available || register.Bits != walker.abi().bits {
 			continue
 		}
 		value, err := contextScalar(register)
@@ -110,10 +114,10 @@ func (c *Controller) newAddressView(ctx context.Context, snapshot target.Snapsho
 	if mapErr != nil {
 		mappings = nil
 	}
-	walker, err := newAddressWalker(c.session, snapshot.Memory, mappings, registers, c.renderer)
+	walker, err := newAddressWalker(c.session, snapshot.Memory, mappings, registers, c.renderer, snapshot.Architecture)
 	if err != nil {
 		mapErr = errors.Join(mapErr, err)
-		walker, err = newAddressWalker(c.session, snapshot.Memory, nil, registers, c.renderer)
+		walker, err = newAddressWalker(c.session, snapshot.Memory, nil, registers, c.renderer, snapshot.Architecture)
 		if err != nil {
 			return nil, errors.Join(mapErr, err)
 		}
@@ -158,10 +162,10 @@ func (walker *addressWalker) terminal(address target.Address) string {
 	if !walker.maps[index].Read {
 		return "unreadable"
 	}
-	if uint64(address) > math.MaxUint64-7 {
+	if uint64(address) > walker.abi().maximum-uint64(walker.abi().word-1) {
 		return "boundary"
 	}
-	last := address + 7
+	last := address + target.Address(walker.abi().word-1)
 	cursor := address
 	for ; index < len(walker.maps); index++ {
 		mapping := walker.maps[index]
@@ -182,23 +186,23 @@ func (walker *addressWalker) terminal(address target.Address) string {
 func (walker *addressWalker) Address(address target.Address) (string, error) {
 	index := walker.mapIndex(address)
 	if walker.mapErr != nil || index < 0 {
-		return walker.renderer.Address(target.AMD64, address, display.AddressUnknown)
+		return walker.renderer.Address(walker.abi().arch, address, display.AddressUnknown)
 	}
 	mapping := walker.maps[index]
-	return walker.renderer.AddressPermissions(target.AMD64, address, mapping.Read, mapping.Write, mapping.Execute)
+	return walker.renderer.AddressPermissions(walker.abi().arch, address, mapping.Read, mapping.Write, mapping.Execute)
 }
 
 func (walker *addressWalker) Labels(address target.Address) string {
 	labels := walker.labels[address]
-	rsp, rbp := slices.Contains(labels, "$rsp>"), slices.Contains(labels, "$rbp>")
+	rsp, rbp := slices.Contains(labels, "$"+walker.abi().sp+">"), slices.Contains(labels, "$"+walker.abi().bp+">")
 	if rsp && rbp {
-		return "$rsp/rbp>"
+		return "$" + walker.abi().sp + "/" + walker.abi().bp + ">"
 	}
 	if rsp {
-		return "$rsp>"
+		return "$" + walker.abi().sp + ">"
 	}
 	if rbp {
-		return "$rbp>"
+		return "$" + walker.abi().bp + ">"
 	}
 	return ""
 }
@@ -243,8 +247,8 @@ func (walker *addressWalker) word(ctx context.Context, address target.Address, m
 	}
 	word := addressWalkWord{}
 	walker.reads++
-	n, err := walker.reader.ReadSpaceMemory(walker.memory, address, word.data[:])
-	data, err := inspectionConfirmedBytes(word.data[:], n, err)
+	n, err := walker.reader.ReadSpaceMemory(walker.memory, address, word.data[:walker.abi().word])
+	data, err := inspectionConfirmedBytes(word.data[:walker.abi().word], n, err)
 	word.n, word.err = len(data), err
 	if err := contextReady(ctx); err != nil {
 		word.err = errors.Join(word.err, err)
@@ -253,12 +257,12 @@ func (walker *addressWalker) word(ctx context.Context, address target.Address, m
 		walker.fatal = word.err
 		return addressWalkWord{err: word.err}
 	}
-	if word.n == 8 {
-		word.value = inspectionWord(word.data[:])
+	if word.n == walker.abi().word {
+		word.value = inspectionWord(word.data[:walker.abi().word])
 	}
 	walker.cache[address] = word
-	if word.err == nil && word.n == 8 {
-		walker.rememberTextBytes(address, word.data[:])
+	if word.err == nil && word.n == walker.abi().word {
+		walker.rememberTextBytes(address, word.data[:walker.abi().word])
 	}
 	return word
 }
@@ -271,7 +275,7 @@ func (walker *addressWalker) unavailable(word addressWalkWord) string {
 	if word.n == 0 {
 		return walker.renderer.Text(display.StyleError, "[unavailable]")
 	}
-	return walker.renderer.Text(display.StyleError, fmt.Sprintf("<partial %d/8: %s>", word.n, display.FormatBytes(word.data[:word.n])))
+	return walker.renderer.Text(display.StyleError, fmt.Sprintf("<partial %d/%d: %s>", word.n, walker.abi().word, display.FormatBytes(word.data[:word.n])))
 }
 
 func (walker *addressWalker) walk(ctx context.Context, value uint64, depth int, visited map[target.Address]bool, source addressTextSource) (string, error) {
@@ -321,7 +325,7 @@ func (walker *addressWalker) walk(ctx context.Context, value uint64, depth int, 
 		if word.terminal != "" {
 			return text + " " + walker.state(word.terminal), word.err
 		}
-		if word.n != 8 {
+		if word.n != walker.abi().word {
 			return text + " -> " + walker.unavailable(word), word.err
 		}
 		value = word.value
@@ -351,20 +355,23 @@ func (walker *addressWalker) Rows(ctx context.Context, address target.Address, c
 	if err := walker.ready(ctx); err != nil {
 		return "", err
 	}
-	if count < 1 || count > maxMemoryBytes/8 || depth < 0 || depth > maxAddressWalkDepth {
+	if count < 1 || count > maxMemoryBytes/walker.abi().word || depth < 0 || depth > maxAddressWalkDepth {
 		return "", target.ErrInvalidArgument
 	}
-	if err := inspectionRange(address, count*8); err != nil {
+	if err := inspectionRange(address, count*walker.abi().word); err != nil {
 		return "", err
 	}
 	var output strings.Builder
 	for index := 0; index < count; index++ {
-		current := address + target.Address(index*8)
+		current := address + target.Address(index*walker.abi().word)
 		word := walker.word(ctx, current, false)
 		if addressWalkFatal(word.err) {
 			return "", word.err
 		}
 		addressText, err := walker.Address(current)
+		if walker.rowStyle != display.StylePlain {
+			addressText = walker.renderer.Text(walker.rowStyle, fmt.Sprintf("0x%0*x", walker.abi().word*2, current))
+		}
 		if err != nil {
 			return "", err
 		}
@@ -373,7 +380,7 @@ func (walker *addressWalker) Rows(ctx context.Context, address target.Address, c
 		switch {
 		case word.terminal != "":
 			valueText = walker.state(word.terminal)
-		case word.n != 8:
+		case word.n != walker.abi().word:
 			valueText = walker.unavailable(word)
 		case word.err != nil:
 			valueText, err = walker.valueText(word.value)
@@ -390,7 +397,7 @@ func (walker *addressWalker) Rows(ctx context.Context, address target.Address, c
 		if addressWalkFatal(readErr) {
 			return "", readErr
 		}
-		fmt.Fprintf(&output, "%-9s %s|+0x%04x|+%03d: %s\n", walker.Labels(current), addressText, index*8, index, valueText)
+		fmt.Fprintf(&output, "%-9s %s|+0x%04x|+%03d: %s\n", walker.Labels(current), addressText, index*walker.abi().word, index, valueText)
 		if readErr != nil {
 			return output.String(), readErr
 		}
@@ -414,6 +421,9 @@ func (c *Controller) addressWalkExpression(ctx context.Context, expression strin
 	}
 	resolver := &lazyInspectionResolver{controller: c, ctx: ctx, snapshot: snapshot, thread: thread, ready: true, registers: registers, readRegs: true}
 	value, err := inspect.EvalExpression(expression, resolver)
+	if err == nil && value > abiFor(snapshot.Architecture).maximum {
+		return 0, nil, target.ErrOverflow
+	}
 	return target.Address(value), registers, errors.Join(err, contextReady(ctx))
 }
 

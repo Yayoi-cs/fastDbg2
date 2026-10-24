@@ -43,8 +43,8 @@ func TestPermissionColorsUseOnlyExplicitPermissionBits(t *testing.T) {
 		read, write, execute bool
 		code                 string
 	}{
-		{true, true, true, "33"}, {true, false, true, "31"}, {false, false, true, "31"},
-		{true, true, false, "36"}, {true, false, false, "34"}, {false, true, false, "32"}, {false, false, false, "90"},
+		{true, true, true, "33"}, {true, false, true, "35"}, {false, false, true, "35"},
+		{true, true, false, "36"}, {true, false, false, "34"}, {false, true, false, "32"}, {false, false, false, ""},
 	} {
 		for _, address := range []target.Address{0, 0x401000, 0x7ffffffff000} {
 			var plain display.Renderer
@@ -53,7 +53,10 @@ func TestPermissionColorsUseOnlyExplicitPermissionBits(t *testing.T) {
 				t.Fatalf("plain permission address: %q %v", text, err)
 			}
 			got, err := renderer.AddressPermissions(target.AMD64, address, test.read, test.write, test.execute)
-			want := "\x1b[" + test.code + "m" + text + "\x1b[0m"
+			want := text
+			if test.code != "" {
+				want = "\x1b[" + test.code + "m" + text + "\x1b[0m"
+			}
 			if err != nil || got != want {
 				t.Fatalf("explicit permissions %+v: %q %v, want %q", test, got, err, want)
 			}

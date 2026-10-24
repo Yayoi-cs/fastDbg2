@@ -74,7 +74,7 @@ func TestLatestPagerHelpPreservesTerminalAndPipeContracts(t *testing.T) {
 			t.Fatalf("pager help retains screen restoration workaround: %s", text)
 		}
 	}
-	if text := latestHelpText(t, "tel"); !strings.Contains(text, "COUNT defaults to 128 qwords") || !strings.Contains(text, "bounded at 512") || !strings.Contains(text, "Default depth is 4") {
+	if text := latestHelpText(t, "tel"); !strings.Contains(text, "COUNT defaults to 128 native-width words") || !strings.Contains(text, "bounded at 1024 on x86 or 512 on amd64") || !strings.Contains(text, "Default depth is 4") {
 		t.Fatalf("telescope defaults diverge from legacy pager contract: %s", text)
 	}
 }

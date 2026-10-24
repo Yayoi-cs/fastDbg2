@@ -488,7 +488,7 @@ func TestControllerSelectionNeverFallsBackOrCrossesProcess(t *testing.T) {
 func TestControllerRejectsArchitectureChangeAndRetainsFailedCleanup(t *testing.T) {
 	c := configuredController(t, io.Discard)
 	s := controllerSession(1)
-	s.snapshot.Architecture = target.X86
+	s.snapshot.Architecture = target.AArch64
 	s.closeError = target.ErrPartial
 	c.launch = func(string, []string) (session, error) { return s, nil }
 	_, err := c.Execute(context.Background(), "start", "")

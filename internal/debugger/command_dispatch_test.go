@@ -71,7 +71,7 @@ func TestCommandHelpDocumentsIntentionalDifferences(t *testing.T) {
 		{"p/d", []string{"unsigned 64-bit", "int64", "not GDB C-type"}},
 		{"x/8xb", []string{"EXPR", "4096 bytes", "256 instructions", "byte units only", "not reused"}},
 		{"disass", []string{"maximum 256", "InstructionPC", "raw RIP"}},
-		{"stack", []string{"maximum 512", "actual selected thread RSP"}},
+		{"stack", []string{"maximum 1024 on x86", "512 on amd64", "selected thread ESP/RSP"}},
 		{"hexdump", []string{"64, 32, 16 and 8", "4096 bytes", "counts units"}},
 		{"delete", []string{"No arguments is an error", "All IDs are validated"}},
 		{"info registers", []string{"info registers", "Only these explicit subcommands"}},

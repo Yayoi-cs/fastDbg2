@@ -22,7 +22,7 @@ func (c *Controller) publishVMMap(ctx context.Context, snapshot target.Snapshot,
 	return c.writef("%s", text)
 }
 
-func renderVMMap(ctx context.Context, mappings []procMap, filter string, width int, renderer display.Renderer) (string, error) {
+func renderVMMap(ctx context.Context, mappings []procMap, filter string, width int, renderer display.Renderer, architectures ...target.Architecture) (string, error) {
 	if err := contextReady(ctx); err != nil {
 		return "", err
 	}
@@ -30,6 +30,11 @@ func renderVMMap(ctx context.Context, mappings []procMap, filter string, width i
 		width = display.DefaultWidth
 	}
 	width = min(width, 512)
+	arch := target.AMD64
+	if len(architectures) > 0 {
+		arch = architectures[0]
+	}
+	digits := abiFor(arch).word * 2
 	var selected []procMap
 	sizeWidth, offsetWidth := 8, 8
 	deviceWidth, inodeWidth := len("Dev"), len("Inode")
@@ -51,13 +56,13 @@ func renderVMMap(ctx context.Context, mappings []procMap, filter string, width i
 	}
 	var output strings.Builder
 	output.WriteString(renderer.Section("vmmap", width) + "\n")
-	heading := fmt.Sprintf("%-18s %-18s %-*s %-*s %-4s %-*s %-*s Path", "Start", "End", sizeWidth+2, "Size", offsetWidth+2, "Offset", "Perm", deviceWidth, "Dev", inodeWidth, "Inode")
+	heading := fmt.Sprintf("%-*s %-*s %-*s %-*s %-4s %-*s %-*s Path", digits+2, "Start", digits+2, "End", sizeWidth+2, "Size", offsetWidth+2, "Offset", "Perm", deviceWidth, "Dev", inodeWidth, "Inode")
 	output.WriteString(renderer.Text(display.StyleHeading, display.Wrap(heading, width, 4)) + "\n")
 	for _, mapping := range selected {
 		if err := contextReady(ctx); err != nil {
 			return "", err
 		}
-		base := fmt.Sprintf("0x%016x 0x%016x 0x%0*x 0x%0*x %s", mapping.Start, mapping.End, sizeWidth, mapping.End-mapping.Start, offsetWidth, mapping.Offset, mapping.permissions())
+		base := fmt.Sprintf("0x%0*x 0x%0*x 0x%0*x 0x%0*x %s", digits, mapping.Start, digits, mapping.End, sizeWidth, mapping.End-mapping.Start, offsetWidth, mapping.Offset, mapping.permissions())
 		metadata := fmt.Sprintf("%-*s %-*d ", deviceWidth, fmt.Sprintf("%x:%x", mapping.DevMajor, mapping.DevMinor), inodeWidth, mapping.Inode)
 		path := strconv.QuoteToGraphic(mapping.Path)
 		var lines []string

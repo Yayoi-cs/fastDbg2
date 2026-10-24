@@ -289,7 +289,7 @@ func TestCommandExpansionNativeInspection(t *testing.T) {
 				t.Fatalf("software breakpoint location: %+v, %v", location, err)
 			}
 			logical := f.command(t, "disass --count 1")
-			if !strings.Contains(logical, fmt.Sprintf("raw-pc=0x%016x instruction-pc=0x%016x", location.RawPC, location.InstructionPC)) {
+			if !strings.Contains(logical, fmt.Sprintf("=> 0x%016x", location.InstructionPC)) {
 				t.Fatalf("disassembly location provenance: %s", logical)
 			}
 			explicit := f.command(t, "x/1i $rip")

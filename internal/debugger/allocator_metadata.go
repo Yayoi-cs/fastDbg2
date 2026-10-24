@@ -90,6 +90,9 @@ func (c *Controller) withAllocatorContext(ctx context.Context, snapshot target.S
 		if err != nil {
 			return err
 		}
+		if target.Architecture(profile.Layout.Arch) != snapshot.Architecture || profile.Layout.Pointer != uint64(abiFor(snapshot.Architecture).word) {
+			return fmt.Errorf("allocator profile ABI differs from the stopped process: %w", target.ErrInvalidArgument)
+		}
 		libcSource, err := openRuntimeMappedELF(proc, libc)
 		if err != nil {
 			return err
@@ -100,7 +103,7 @@ func (c *Controller) withAllocatorContext(ctx context.Context, snapshot target.S
 			return err
 		}
 		defer func() { err = errors.Join(err, loaderSource.Source.Close()) }()
-		registers, err := c.session.ReadThreadRegisters(thread.Token)
+		registers, err := c.allocatorRegisters(snapshot, thread)
 		if err != nil {
 			return err
 		}
@@ -358,7 +361,7 @@ func allocatorTLSProgram(module *runtimeELFModule) (elf.ProgHeader, error) {
 }
 
 func allocatorTLSVariable(memory *runtimeELFMemory, module *runtimeELFModule, base target.Address, symbol allocatorSymbol) (target.Address, error) {
-	if symbol.Size != 8 {
+	if symbol.Size != uint64(abiFor(module.Architecture).word) {
 		return 0, target.ErrInvalidArgument
 	}
 	value, err := allocatorTLSScalar(memory, module, base, symbol)
@@ -370,7 +373,7 @@ func allocatorTLSScalar(memory *runtimeELFMemory, module *runtimeELFModule, base
 	if err != nil {
 		return 0, err
 	}
-	if symbol.Type != uint64(elf.STT_TLS) || symbol.Size != 8 && symbol.Size != 1 || symbol.Value > program.Memsz || symbol.Size > program.Memsz-symbol.Value {
+	if symbol.Type != uint64(elf.STT_TLS) || symbol.Size != uint64(abiFor(module.Architecture).word) && symbol.Size != 1 || symbol.Value > program.Memsz || symbol.Size > program.Memsz-symbol.Value {
 		return 0, fmt.Errorf("allocator variable has no exact TLS extent: %w", target.ErrInvalidArgument)
 	}
 	return allocatorReadWord(memory, base, symbol.Value, symbol.Size)
@@ -380,7 +383,12 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 	if len(libc.Links) != 1 {
 		return 0, target.ErrAmbiguous
 	}
-	fsbase, err := (expressionResolver{registers: registers}).ResolveRegister("fs_base")
+	word := profile.Layout.Pointer
+	baseRegister := "fs_base"
+	if word == 4 {
+		baseRegister = "gs_base"
+	}
+	fsbase, err := (expressionResolver{registers: registers}).ResolveRegister(baseRegister)
 	if err != nil {
 		return 0, err
 	}
@@ -390,7 +398,7 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 	pd := target.Address(fsbase)
 	tls := profile.TLS
 	for _, offset := range []uint64{tls.ThreadSelfOffset, tls.ThreadTCBOffset} {
-		value, err := allocatorReadWord(memory, pd, offset, 8)
+		value, err := allocatorReadWord(memory, pd, offset, word)
 		if err != nil {
 			return 0, err
 		}
@@ -406,7 +414,7 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 		return 0, fmt.Errorf("selected TCB tid %d differs from thread %d: %w", tid, thread.TID, target.ErrStale)
 	}
 	link := libc.Links[0].Address
-	modid, err := allocatorReadWord(memory, link, tls.LinkMapModIDOffset, 8)
+	modid, err := allocatorReadWord(memory, link, tls.LinkMapModIDOffset, word)
 	if err != nil {
 		return 0, err
 	}
@@ -417,7 +425,7 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 	if err != nil {
 		return 0, err
 	}
-	blockSize, err := allocatorReadWord(memory, link, tls.LinkMapBlockSizeOffset, 8)
+	blockSize, err := allocatorReadWord(memory, link, tls.LinkMapBlockSizeOffset, word)
 	if err != nil {
 		return 0, err
 	}
@@ -428,49 +436,49 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 	if err != nil {
 		return 0, err
 	}
-	globalGeneration, err := allocatorReadWord(memory, global, tls.RTLDGenerationOffset, 8)
+	globalGeneration, err := allocatorReadWord(memory, global, tls.RTLDGenerationOffset, word)
 	if err != nil {
 		return 0, err
 	}
-	head, err := allocatorReadWord(memory, global, tls.RTLDSlotInfoOffset, 8)
+	head, err := allocatorReadWord(memory, global, tls.RTLDSlotInfoOffset, word)
 	if err != nil {
 		return 0, err
 	}
-	slot, err := allocatorTLSSlot(memory, tls, target.Address(head), modid)
+	slot, err := allocatorTLSSlot(memory, tls, target.Address(head), modid, word)
 	if err != nil {
 		return 0, err
 	}
-	mapAddress, err := allocatorReadWord(memory, slot, tls.SlotMapOffset, 8)
+	mapAddress, err := allocatorReadWord(memory, slot, tls.SlotMapOffset, word)
 	if err != nil {
 		return 0, err
 	}
 	if target.Address(mapAddress) != link {
 		return 0, fmt.Errorf("TLS slotinfo module differs from exact allocator link_map: %w", target.ErrStale)
 	}
-	moduleGeneration, err := allocatorReadWord(memory, slot, tls.SlotGenerationOffset, 8)
+	moduleGeneration, err := allocatorReadWord(memory, slot, tls.SlotGenerationOffset, word)
 	if err != nil {
 		return 0, err
 	}
-	dtv, err := allocatorReadWord(memory, pd, tls.ThreadDTVOffset, 8)
+	dtv, err := allocatorReadWord(memory, pd, tls.ThreadDTVOffset, word)
 	if err != nil {
 		return 0, err
 	}
 	if dtv < tls.DTVEntrySize {
 		return 0, fmt.Errorf("selected thread DTV is not initialized: %w", target.ErrUnavailable)
 	}
-	dtvGeneration, err := allocatorReadWord(memory, target.Address(dtv), tls.DTVGenerationOffset, 8)
+	dtvGeneration, err := allocatorReadWord(memory, target.Address(dtv), tls.DTVGenerationOffset, word)
 	if err != nil {
 		return 0, err
 	}
 	if moduleGeneration > globalGeneration || dtvGeneration > globalGeneration {
 		return 0, fmt.Errorf("TLS generation metadata is inconsistent: %w", target.ErrInvalidArgument)
 	}
-	staticOffset, err := allocatorReadWord(memory, link, tls.LinkMapStaticOffset, 8)
+	staticOffset, err := allocatorReadWord(memory, link, tls.LinkMapStaticOffset, word)
 	if err != nil {
 		return 0, err
 	}
 	staticBase := target.Address(0)
-	if staticOffset != 0 && staticOffset != math.MaxUint64 {
+	if staticOffset != 0 && staticOffset != abiFor(libc.Architecture).maximum {
 		if staticOffset > fsbase {
 			return 0, target.ErrOverflow
 		}
@@ -478,7 +486,7 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 	}
 	base := staticBase
 	if dtvGeneration >= moduleGeneration {
-		capacity, err := allocatorReadWord(memory, target.Address(dtv-tls.DTVEntrySize), tls.DTVGenerationOffset, 8)
+		capacity, err := allocatorReadWord(memory, target.Address(dtv-tls.DTVEntrySize), tls.DTVGenerationOffset, word)
 		if err != nil {
 			return 0, err
 		}
@@ -492,7 +500,7 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 		if err != nil {
 			return 0, err
 		}
-		value, err := allocatorReadWord(memory, entry, tls.DTVPointerOffset, 8)
+		value, err := allocatorReadWord(memory, entry, tls.DTVPointerOffset, word)
 		if err != nil {
 			return 0, err
 		}
@@ -512,7 +520,11 @@ func allocatorTLSBase(memory *runtimeELFMemory, profile allocatorProfile, libc, 
 	return base, nil
 }
 
-func allocatorTLSSlot(memory *runtimeELFMemory, profile allocatorTLSProfile, head target.Address, modid uint64) (target.Address, error) {
+func allocatorTLSSlot(memory *runtimeELFMemory, profile allocatorTLSProfile, head target.Address, modid uint64, widths ...uint64) (target.Address, error) {
+	word := uint64(8)
+	if len(widths) > 0 {
+		word = widths[0]
+	}
 	seen := make(map[target.Address]bool)
 	var first uint64
 	for head != 0 {
@@ -520,7 +532,7 @@ func allocatorTLSSlot(memory *runtimeELFMemory, profile allocatorTLSProfile, hea
 			return 0, fmt.Errorf("TLS slotinfo list is cyclic or exceeds inspection limit: %w", target.ErrInvalidArgument)
 		}
 		seen[head] = true
-		length, err := allocatorReadWord(memory, head, profile.SlotListLengthOffset, 8)
+		length, err := allocatorReadWord(memory, head, profile.SlotListLengthOffset, word)
 		if err != nil {
 			return 0, err
 		}
@@ -535,7 +547,7 @@ func allocatorTLSSlot(memory *runtimeELFMemory, profile allocatorTLSProfile, hea
 			return allocatorAddress(head, profile.SlotListEntriesOffset+index*profile.SlotEntrySize)
 		}
 		first += length
-		next, err := allocatorReadWord(memory, head, profile.SlotListNextOffset, 8)
+		next, err := allocatorReadWord(memory, head, profile.SlotListNextOffset, word)
 		if err != nil {
 			return 0, err
 		}
@@ -571,12 +583,12 @@ func (info *allocatorContext) HeapExtents(arena target.Address) ([]allocatorHeap
 	if top == 0 {
 		return nil, fmt.Errorf("allocated arena has no top chunk: %w", target.ErrUnavailable)
 	}
-	topSize, err := allocatorReadWord(info.memory, top, info.Layout.Chunk.Fields["mchunk_size"].Offset, 8)
+	topSize, err := allocatorReadWord(info.memory, top, info.Layout.Chunk.Fields["mchunk_size"].Offset, info.Layout.Pointer)
 	if err != nil {
 		return nil, err
 	}
 	topSize &^= info.SizeFlags
-	if topSize < info.MinChunkSize || topSize%info.Alignment != 0 {
+	if topSize < info.MinChunkSize || (topSize+info.ChunkHeaderSize)%info.Alignment != 0 {
 		return nil, fmt.Errorf("arena top chunk has an invalid extent: %w", target.ErrInvalidArgument)
 	}
 	topEnd, err := allocatorAddress(top, topSize)
@@ -671,7 +683,7 @@ func (info *allocatorContext) HeapExtents(arena target.Address) ([]allocatorHeap
 }
 
 func (info *allocatorContext) closedHeapFencepost(start, end target.Address) (target.Address, error) {
-	if info.ChunkHeaderSize != 16 || info.MinChunkSize != 32 || info.Alignment != 16 || end < start || uint64(end-start) < 2*info.ChunkHeaderSize {
+	if info.ChunkHeaderSize != 2*info.Layout.Pointer || info.MinChunkSize != 4*info.Layout.Pointer || info.Alignment != 16 || end < start || uint64(end-start) < 2*info.ChunkHeaderSize {
 		return 0, fmt.Errorf("closed heap fencepost geometry is unsupported: %w", target.ErrUnsupported)
 	}
 	terminal := end - target.Address(info.MinChunkSize-info.ChunkHeaderSize)
@@ -679,12 +691,12 @@ func (info *allocatorContext) closedHeapFencepost(start, end target.Address) (ta
 	if err != nil {
 		return 0, err
 	}
-	previous := binary.LittleEndian.Uint64(data)
-	if binary.LittleEndian.Uint64(data[8:]) != 1 || previous != info.ChunkHeaderSize && previous != info.MinChunkSize || previous > uint64(terminal-start) {
+	previous := inspectionWord(data[:info.Layout.Pointer])
+	if inspectionWord(data[info.Layout.Pointer:]) != 1 || previous != info.ChunkHeaderSize && previous != info.MinChunkSize || previous > uint64(terminal-start) {
 		return 0, fmt.Errorf("closed heap terminal fencepost differs from exact allocator source: %w", target.ErrInvalidArgument)
 	}
 	predecessor := terminal - target.Address(previous)
-	rawSize, err := allocatorReadWord(info.memory, predecessor, info.Layout.Chunk.Fields["mchunk_size"].Offset, 8)
+	rawSize, err := allocatorReadWord(info.memory, predecessor, info.Layout.Chunk.Fields["mchunk_size"].Offset, info.Layout.Pointer)
 	if err != nil {
 		return 0, err
 	}

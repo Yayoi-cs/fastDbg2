@@ -4,7 +4,6 @@ import (
 	"context"
 	"debug/dwarf"
 	"debug/elf"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -79,7 +78,11 @@ func heapDWARFData(file *elf.File) (*dwarf.Data, error) {
 	return file.DWARF()
 }
 
-func heapMainArenaType(ctx context.Context, data *dwarf.Data, symbol elf.Symbol) (dwarf.Offset, error) {
+func heapMainArenaType(ctx context.Context, data *dwarf.Data, symbol elf.Symbol, widths ...int) (dwarf.Offset, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
 	if data == nil {
 		return 0, target.ErrInvalidArgument
 	}
@@ -112,7 +115,7 @@ func heapMainArenaType(ctx context.Context, data *dwarf.Data, symbol elf.Symbol)
 			}
 			seen[field.Attr] = true
 		}
-		if reader.AddressSize() != 8 {
+		if reader.AddressSize() != word {
 			return 0, fmt.Errorf("heap DWARF variable uses a non-AMD64 address size: %w", target.ErrUnsupported)
 		}
 		variables = append(variables, entry)
@@ -137,10 +140,10 @@ func heapMainArenaType(ctx context.Context, data *dwarf.Data, symbol elf.Symbol)
 			return 0, fmt.Errorf("main_arena DWARF specification and abstract-origin definitions are not supported: %w", target.ErrUnsupported)
 		}
 		location, ok := entry.Val(dwarf.AttrLocation).([]byte)
-		if !ok || len(location) != 9 || location[0] != 0x03 {
+		if !ok || len(location) != word+1 || location[0] != 0x03 {
 			return 0, fmt.Errorf("main_arena DWARF location must be one exact AMD64 DW_OP_addr: %w", target.ErrUnsupported)
 		}
-		if binary.LittleEndian.Uint64(location[1:]) != symbol.Value {
+		if inspectionWord(location[1:]) != symbol.Value {
 			return 0, fmt.Errorf("main_arena DWARF location differs from its ELF object definition: %w", target.ErrInvalidArgument)
 		}
 		typeOffset, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
@@ -217,7 +220,7 @@ func (c *Controller) withHeapDWARFInput(ctx context.Context, arguments heapGraph
 			file = association.File
 			proof += fmt.Sprintf(" debug-file=%q debug-proof=%q", association.Path, association.Proof)
 		}
-		if err := validateAMD64ELF(file); err != nil {
+		if err := validateNativeELF(file); err != nil {
 			return err
 		}
 		symbol, err := heapMainArenaSymbol(file)
@@ -228,7 +231,8 @@ func (c *Controller) withHeapDWARFInput(ctx context.Context, arguments heapGraph
 		if err != nil {
 			return err
 		}
-		typeOffset, err := heapMainArenaType(ctx, data, symbol)
+		arch, _ := nativeELFArchitecture(file)
+		typeOffset, err := heapMainArenaType(ctx, data, symbol, abiFor(arch).word)
 		if err != nil {
 			return err
 		}

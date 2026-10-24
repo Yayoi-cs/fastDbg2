@@ -147,6 +147,7 @@ int main(int n, char **v) {
         if (!strcmp(v[1], "readythread")) { puts("ready"); fflush(stdout); }
     }
     if (n > 1 && !strcmp(v[1], "fork")) { if (fork() < 0) return 97; }
+    if (n > 1 && !strcmp(v[1], "loop")) { puts("ready"); fflush(stdout); }
     spin(0);
     return 0;
 }`
@@ -361,6 +362,11 @@ func startUntraced(t *testing.T, path, mode string) *exec.Cmd {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, path, mode)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		t.Fatal(err)
@@ -371,6 +377,10 @@ func startUntraced(t *testing.T, path, mode string) *exec.Cmd {
 			t.Error(err)
 		}
 	})
+	line, err := coreCall(t, func() (string, error) { return bufio.NewReader(stdout).ReadString('\n') })
+	if err != nil || line != "ready\n" {
+		t.Fatalf("fixture readiness %q: %v", line, err)
+	}
 	return cmd
 }
 

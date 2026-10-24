@@ -25,6 +25,7 @@ const (
 )
 
 type metadataView struct {
+	arch     target.Architecture
 	width    int
 	renderer display.Renderer
 	output   strings.Builder
@@ -52,7 +53,7 @@ func newMetadataModuleHeader(module *mappedELF) metadataModuleHeader {
 }
 
 func (c *Controller) metadataView() *metadataView {
-	return &metadataView{width: display.OutputWidth(c.out), renderer: c.renderer}
+	return &metadataView{arch: c.abi().arch, width: display.OutputWidth(c.out), renderer: c.renderer}
 }
 
 func metadataStyle(state metadataState) display.Style {
@@ -64,9 +65,9 @@ func metadataStyle(state metadataState) display.Style {
 	case metadataAbsent:
 		return display.StyleError
 	case metadataUnknown:
-		return display.StyleMuted
+		return display.StyleYellow
 	default:
-		return display.StylePlain
+		return display.StyleCyan
 	}
 }
 
@@ -102,7 +103,7 @@ func (view *metadataView) field(label, value string, state metadataState) {
 	prefix := display.Pad(contextEscapedText(label), 11) + ": "
 	for index, line := range metadataLines(prefix+value, view.width, len(prefix)) {
 		if index == 0 && strings.HasPrefix(line, prefix) {
-			view.output.WriteString(view.renderer.Text(display.StyleSymbol, prefix))
+			view.output.WriteString(prefix)
 			view.output.WriteString(view.renderer.Text(metadataStyle(state), line[len(prefix):]) + "\n")
 		} else {
 			view.output.WriteString(view.renderer.Text(metadataStyle(state), line) + "\n")
@@ -128,92 +129,71 @@ func (view *metadataView) moduleHeader(title string, module metadataModuleHeader
 	if title != "" {
 		view.heading(title)
 	}
-	view.field("Module", strconv.QuoteToGraphic(module.id), metadataPlain)
 	label := "File"
 	if module.runtime {
 		label = "Runtime"
 	}
 	view.field(label, strconv.QuoteToGraphic(module.path), metadataPlain)
-	view.field("Source proof", strconv.QuoteToGraphic(module.proof), metadataPlain)
-	view.field("Scope", strconv.QuoteToGraphic(module.scope), metadataPlain)
-	if module.runtime {
-		view.field("Metadata", "runtime memory", metadataPlain)
-	} else if module.metadataPath == module.path {
-		view.field("Metadata", "ELF file shown above", metadataPlain)
-	} else {
-		view.field("Metadata file", strconv.QuoteToGraphic(module.metadataPath), metadataPlain)
-	}
-	if module.buildID != "" {
-		view.field("Build ID", module.buildID, metadataPlain)
-	}
-	if module.proof == kernelBuildIDMetadataProof {
-		view.note("Metadata association only; backing-file identity is not established.", metadataPartial)
-	}
 }
 
 func (view *metadataView) security(facts elfSecurityFacts) {
 	view.field("Type", facts.kind.String(), metadataPlain)
-	pie, pieState := "not declared (no DF_1_PIE; ET_DYN alone does not establish PIE)", metadataUnknown
+	pie, pieState := "Unknown", metadataUnknown
 	if facts.pieFlag {
-		pie, pieState = "declared (DF_1_PIE)", metadataPresent
+		pie, pieState = "Enabled", metadataPresent
 	}
 	if facts.kind == elf.ET_EXEC {
-		pie, pieState = "fixed executable (ET_EXEC)", metadataAbsent
+		pie, pieState = "Disabled", metadataAbsent
 		if facts.pieFlag {
-			pie, pieState = "inconsistent metadata (ET_EXEC and DF_1_PIE)", metadataPartial
+			pie, pieState = "Inconsistent ELF flags", metadataPartial
 		}
 	}
 	view.field("PIE", pie, pieState)
-	nx, nxState := "unknown (no PT_GNU_STACK)", metadataUnknown
+	nx, nxState := "Unknown (no PT_GNU_STACK)", metadataUnknown
 	if facts.stackKnown {
-		nx, nxState = "non-executable (PT_GNU_STACK lacks PF_X)", metadataPresent
+		nx, nxState = "Enabled", metadataPresent
 		if facts.stackExec {
-			nx, nxState = "executable (PT_GNU_STACK has PF_X)", metadataAbsent
+			nx, nxState = "Disabled", metadataAbsent
 		}
 	}
-	view.field("Stack NX", nx, nxState)
-	relro, relroState := "none (no PT_GNU_RELRO)", metadataAbsent
+	view.field("NX", nx, nxState)
+	relro, relroState := "None", metadataAbsent
 	if facts.relro {
-		relro, relroState = "partial (PT_GNU_RELRO; no BIND_NOW declaration)", metadataPartial
+		relro, relroState = "Partial", metadataPartial
 		if facts.bindNow {
-			relro, relroState = "full declarations (PT_GNU_RELRO and BIND_NOW)", metadataPresent
+			relro, relroState = "Full", metadataPresent
 		}
 	}
 	view.field("RELRO", relro, relroState)
-	bindState := metadataAbsent
-	if facts.bindNow {
-		bindState = metadataPresent
-	}
-	view.field("BIND_NOW", strconv.FormatBool(facts.bindNow), bindState)
-	view.field("PT_DYNAMIC", strconv.FormatBool(facts.dynamic), metadataPlain)
-	static, staticState := strconv.FormatBool(facts.static), metadataPlain
+	stripped, strippedState := "No", metadataPresent
 	if !facts.staticKnown {
-		static, staticState = "unknown (runtime dynamic metadata only)", metadataUnknown
+		stripped, strippedState = "Unknown", metadataUnknown
+	} else if !facts.static {
+		stripped, strippedState = "Yes", metadataPartial
 	}
-	view.field("SYMTAB", static, staticState)
+	view.field("Stripped", stripped, strippedState)
 	for _, row := range []struct {
 		label string
 		names []string
-	}{{"Stack-check symbols", facts.canary}, {"Fortify-name symbols (__*_chk)", facts.fortify}} {
-		text, state := "none observed", metadataUnknown
+	}{{"Canary", facts.canary}, {"Fortify", facts.fortify}} {
+		text, state := "Not found", metadataAbsent
 		if !facts.symbols {
-			text = "unknown (no symbol tables)"
+			text = "Unknown (no symbols)"
 		} else if len(row.names) != 0 {
-			text, state = fmt.Sprintf("%q", row.names), metadataPlain
+			text, state = "Found", metadataPresent
 		}
 		view.field(row.label, text, state)
 	}
-	view.note("Symbol presence does not establish instrumentation of every function.", metadataUnknown)
 	if len(facts.rwx) == 0 {
-		view.field("RWX PT_LOAD", "none", metadataPresent)
+		view.field("RWX", "none", metadataPresent)
 	}
 	for _, interval := range facts.rwx {
-		view.field("RWX PT_LOAD", fmt.Sprintf("[%#x, %#x) ELF virtual addresses", interval[0], interval[1]), metadataAbsent)
+		view.field("RWX", fmt.Sprintf("[%#x, %#x)", interval[0], interval[1]), metadataAbsent)
 	}
 }
 
 func (view *metadataView) address(address target.Address, mappings []procMap) string {
-	text := fmt.Sprintf("0x%016x", address)
+	text := fmt.Sprintf("0x%0*x", abiFor(view.arch).word*2, address)
 	index := sort.Search(len(mappings), func(index int) bool { return mappings[index].End > address })
 	if index < len(mappings) && mappings[index].Start <= address {
 		mapping := mappings[index]
@@ -228,7 +208,11 @@ func (view *metadataView) relocation(relocation elfPointerRelocation, value uint
 	if known {
 		raw = view.address(target.Address(value), mappings)
 	}
-	prefix := slot + " " + display.Pad(raw, 18) + " " + display.Pad(relocation.kind.String(), 22)
+	kind := relocation.kind.String()
+	if view.arch == target.X86 {
+		kind = elf.R_386(relocation.kind).String()
+	}
+	prefix := slot + " " + display.Pad(raw, abiFor(view.arch).word*2+2) + " " + display.Pad(kind, 22)
 	suffix := strconv.QuoteToGraphic(relocation.symbol) + " / " + strconv.QuoteToGraphic(relocation.section)
 	if display.VisibleWidth(prefix+" "+suffix) <= view.width {
 		view.output.WriteString(prefix + " " + view.renderer.Text(display.StyleSymbol, suffix) + "\n")
@@ -246,7 +230,6 @@ func (c *Controller) publishMetadata(ctx context.Context, view *metadataView, sc
 	}
 	if scanErr != nil {
 		view.unavailable("Scope", scanErr)
-		view.note("Only verified metadata is shown; the module scan is incomplete.", metadataPartial)
 	}
 	return errors.Join(c.writef("%s", view.output.String()), scanErr, detailErr)
 }

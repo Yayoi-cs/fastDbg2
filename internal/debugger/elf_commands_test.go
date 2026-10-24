@@ -115,7 +115,7 @@ func TestELFSecurityFactsAreEvidenceNotProtectionGuesses(t *testing.T) {
 	if err := controller.printELFSecurity("file\n\x1b[31m", facts); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"declared (DF_1_PIE)", "full declarations", "Stack-check symbols: [\"__stack_chk_fail\"]", "Fortify-name symbols (__*_chk): [\"__memcpy_chk\"]", "does not establish instrumentation", "file\\n\\x1b[31m"} {
+	for _, want := range []string{"PIE        : Enabled", "RELRO      : Full", "Canary     : Found", "Fortify    : Found", "file\\n\\x1b[31m"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing %q: %q", want, output.String())
 		}
@@ -136,7 +136,7 @@ func TestELFSecurityETDYNWithoutPIEFlagAndMissingMetadata(t *testing.T) {
 	if err := (&Controller{out: &output}).printELFSecurity("x", facts); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"ET_DYN alone does not establish PIE", "unknown (no PT_GNU_STACK)", "unknown (no symbol tables)"} {
+	for _, want := range []string{"PIE        : Unknown", "Unknown (no PT_GNU_STACK)", "Unknown (no symbols)"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatal(output.String())
 		}

@@ -146,7 +146,6 @@ func TestContextCurrentCodeAndRawRegisters(t *testing.T) {
 		"* 2     1234     1",
 		"[registers]",
 		"$rip   : 0x0000000000401001",
-		"breakpoint instruction 0x0000000000401000; raw $rip = 0x0000000000401001\n",
 		"*-> 0x0000000000401000  90",
 		"[stack]",
 		"$rsp>     0x0000000070000000|+0x0000|+000: 0x0706050403020100\n",
@@ -359,9 +358,9 @@ func TestContextColorPolicyUsesDisplayRenderer(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"\x1b[1m[registers]\x1b[0m",
-		"\x1b[31m0x0000000000401000\x1b[0m",
-		"\x1b[33m0x0000000070000000\x1b[0m",
+		"[registers]",
+		"\x1b[34m0x0000000000401000\x1b[0m",
+		"\x1b[36m0x0000000070000000\x1b[0m",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("missing display style %q:\n%q", want, output.String())
@@ -404,7 +403,7 @@ func TestContextCancellationAndOutputFailuresStopReading(t *testing.T) {
 
 func TestContextRejectsOtherArchitectures(t *testing.T) {
 	fixture, snapshot, thread := newContextFixture()
-	snapshot.Architecture = target.X86
+	snapshot.Architecture = target.AArch64
 	var output bytes.Buffer
 	err := contextTestOutput(&output, display.Renderer{}).context(context.Background(), fixture, snapshot, thread)
 	if !errors.Is(err, target.ErrUnsupported) || output.Len() != 0 || len(fixture.registerTokens) != 0 {

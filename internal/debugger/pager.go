@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"fastdbg2/display"
 	"fastdbg2/internal/shellcmd"
 	"fastdbg2/target"
 
@@ -61,9 +60,7 @@ func (c *Controller) publishPagedAddressWalk(ctx context.Context, heading, body 
 	if addressWalkFatal(readErr) || contextReady(ctx) != nil {
 		return errors.Join(readErr, contextReady(ctx))
 	}
-	width := display.OutputWidth(c.out)
-	text := c.renderer.Section(heading, width) + "\n" + body
-	return errors.Join(readErr, c.publishPaged(ctx, text))
+	return errors.Join(readErr, c.publishPaged(ctx, body))
 }
 
 func pagerEnvironment(directory string) []string {

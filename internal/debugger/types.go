@@ -46,6 +46,7 @@ type breakpoint struct {
 }
 
 type Controller struct {
+	arch             target.Architecture
 	session          session
 	snapshot         target.Snapshot
 	selected         target.ThreadRef

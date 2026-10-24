@@ -78,18 +78,22 @@ func TestMetadataUISecurityUsesDeclaredAbsentAndUnknownStates(t *testing.T) {
 		text  string
 		color string
 	}{
-		{"nx-declared", elfSecurityFacts{kind: elf.ET_DYN, stackKnown: true}, "non-executable (PT_GNU_STACK lacks PF_X)", "1;32"},
-		{"nx-absent", elfSecurityFacts{kind: elf.ET_DYN, stackKnown: true, stackExec: true}, "executable (PT_GNU_STACK has PF_X)", "31"},
-		{"nx-unknown", elfSecurityFacts{kind: elf.ET_DYN}, "unknown (no PT_GNU_STACK)", "2"},
-		{"relro-partial", elfSecurityFacts{kind: elf.ET_DYN, relro: true}, "partial (PT_GNU_RELRO; no BIND_NOW declaration)", "33"},
+		{"nx-declared", elfSecurityFacts{kind: elf.ET_DYN, stackKnown: true}, "Enabled", "32"},
+		{"nx-absent", elfSecurityFacts{kind: elf.ET_DYN, stackKnown: true, stackExec: true}, "Disabled", "31"},
+		{"nx-unknown", elfSecurityFacts{kind: elf.ET_DYN}, "Unknown (no PT_GNU_STACK)", "33"},
+		{"relro-partial", elfSecurityFacts{kind: elf.ET_DYN, relro: true}, "Partial", "33"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			view := &metadataView{width: 120, renderer: renderer}
 			view.security(test.facts)
-			if !strings.Contains(view.output.String(), "\x1b["+test.color+"m"+test.text+"\x1b[0m") {
+			want := test.text
+			if test.color != "" {
+				want = "\x1b[" + test.color + "m" + test.text + "\x1b[0m"
+			}
+			if !strings.Contains(view.output.String(), want) {
 				t.Fatalf("fact state lacks its semantic style: %q", view.output.String())
 			}
-			if !strings.Contains(view.output.String(), "Symbol presence does not establish instrumentation") || strings.Contains(view.output.String(), "Canary: Enabled") {
+			if strings.Contains(view.output.String(), "Symbol presence does not establish instrumentation") || strings.Contains(view.output.String(), "Canary: Enabled") {
 				t.Fatal("symbol presence was promoted to protection")
 			}
 		})
@@ -112,8 +116,8 @@ func TestMetadataUIPathsAndProofsRemainLosslessWithoutDiagnosticWalls(t *testing
 			t.Fatalf("wrapped source/descriptor identity lost:\n%s", text)
 		}
 		for _, want := range []string{`Source proof: "proc-exe+auxv"`, `Scope      : "executable"`, "Metadata   : ELF file shown above"} {
-			if !strings.Contains(text, want) {
-				t.Fatalf("source fact missing %q:\n%s", want, text)
+			if strings.Contains(text, want) {
+				t.Fatalf("internal proof leaked %q:\n%s", want, text)
 			}
 		}
 	}
@@ -131,7 +135,7 @@ func TestMetadataUIGOTUsesOnlyConfirmedMappingPermissions(t *testing.T) {
 	view.relocation(relocation, 0, true, mappings)
 	view.relocation(relocation, 0, false, mappings)
 	text := view.output.String()
-	for _, want := range []string{"\x1b[36m0x0000000000500008\x1b[0m", "\x1b[31m0x0000000000400100\x1b[0m", "0x0000000000000000", "<unavailable>", `"puts" / ".rela.plt"`} {
+	for _, want := range []string{"\x1b[36m0x0000000000500008\x1b[0m", "\x1b[35m0x0000000000400100\x1b[0m", "0x0000000000000000", "<unavailable>", `"puts" / ".rela.plt"`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("confirmed slot/value facts missing %q: %q", want, text)
 		}
@@ -176,7 +180,7 @@ func TestMetadataUIPublishDropsStaleCancellationAndPreservesPartialErrors(t *tes
 				t.Fatalf("error cause lost: %v want %v", err, want)
 			}
 			if mode == "partial" {
-				if !strings.Contains(output.String(), "Confirmed") || !strings.Contains(output.String(), "module scan is incomplete") {
+				if !strings.Contains(output.String(), "Confirmed") || !strings.Contains(output.String(), "Scope") || !strings.Contains(output.String(), "unavailable") {
 					t.Fatal(output.String())
 				}
 			} else if output.Len() != 0 {
@@ -211,17 +215,17 @@ func TestMetadataUIModuleHeaderCopiesTypedSourceFacts(t *testing.T) {
 	view := &metadataView{width: 80}
 	view.moduleHeader("symbols", header)
 	text := view.output.String()
-	for _, want := range []string{`"/target/lib"`, `"/debug/lib"`, "kernel-vma-build-id-metadata", "010203", "backing-file identity is not established"} {
+	for _, want := range []string{`"/target/lib"`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("typed source facts mutated or disappeared: %q\n%s", want, text)
 		}
 	}
-	if !header.present || newMetadataModuleHeader(nil).present || strings.Contains(text, "/changed") {
+	if header.metadataPath != "/debug/lib" || header.proof != kernelBuildIDMetadataProof || header.buildID != "010203" || strings.Contains(text, "Source proof") || !header.present || newMetadataModuleHeader(nil).present || strings.Contains(text, "/changed") {
 		t.Fatal("source header retained mutable metadata or fabricated presence")
 	}
 	fieldsOnly := &metadataView{width: 80}
 	fieldsOnly.moduleHeader("", header)
-	if !strings.HasPrefix(fieldsOnly.output.String(), "Module") || strings.Contains(fieldsOnly.output.String(), "[]") {
+	if !strings.HasPrefix(fieldsOnly.output.String(), "File") || strings.Contains(fieldsOnly.output.String(), "[]") {
 		t.Fatal("empty title emitted another heading")
 	}
 }

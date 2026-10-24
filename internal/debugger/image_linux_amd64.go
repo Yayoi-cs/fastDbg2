@@ -3,7 +3,6 @@ package debugger
 import (
 	"context"
 	"debug/elf"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -54,7 +53,7 @@ func preflightELF(path string) (err error) {
 		return fmt.Errorf("ELF %q: %w", path, err)
 	}
 	defer func() { err = errors.Join(err, file.Close()) }()
-	if err := validateAMD64ELF(file); err != nil {
+	if err := validateNativeELF(file); err != nil {
 		return fmt.Errorf("ELF %q: %w", path, err)
 	}
 	return nil
@@ -74,8 +73,8 @@ func validateAMD64ELF(file *elf.File) error {
 }
 
 func validateImageSnapshot(snapshot target.Snapshot, thread target.ThreadInfo) error {
-	if snapshot.Architecture != target.AMD64 {
-		return fmt.Errorf("commands require AMD64, target is %s: %w", snapshot.Architecture, target.ErrUnsupported)
+	if snapshot.Architecture != target.AMD64 && snapshot.Architecture != target.X86 {
+		return fmt.Errorf("commands require x86 or AMD64, target is %s: %w", snapshot.Architecture, target.ErrUnsupported)
 	}
 	if snapshot.State != target.StateStopped {
 		return fmt.Errorf("target is %s: %w", snapshot.State, target.ErrInvalidState)
@@ -153,14 +152,14 @@ func readLiveImage(ctx context.Context, tid int) (image *loadedImage, err error)
 	if err != nil {
 		return nil, fmt.Errorf("ELF for TID %d: %w", tid, err)
 	}
-	if err := validateAMD64ELF(file); err != nil {
+	if err := validateNativeELF(file); err != nil {
 		return nil, err
 	}
 	auxv, err := os.ReadFile(fmt.Sprintf("/proc/%d/auxv", tid))
 	if err != nil {
 		return nil, fmt.Errorf("auxv for TID %d: %w", tid, err)
 	}
-	bias, err := imageLoadBias(file.Type, file.Entry, auxv)
+	bias, err := imageLoadBiasForELF(file, auxv)
 	if err != nil {
 		return nil, err
 	}
@@ -176,10 +175,22 @@ func readLiveImage(ctx context.Context, tid int) (image *loadedImage, err error)
 }
 
 func imageLoadBias(kind elf.Type, entry uint64, auxv []byte) (uint64, error) {
+	return imageLoadBiasWidth(kind, entry, auxv, 8)
+}
+
+func imageLoadBiasForELF(file *elf.File, auxv []byte) (uint64, error) {
+	arch, err := nativeELFArchitecture(file)
+	if err != nil {
+		return 0, err
+	}
+	return imageLoadBiasWidth(file.Type, file.Entry, auxv, abiFor(arch).word)
+}
+
+func imageLoadBiasWidth(kind elf.Type, entry uint64, auxv []byte, word int) (uint64, error) {
 	if kind != elf.ET_EXEC && kind != elf.ET_DYN {
 		return 0, fmt.Errorf("ELF type %s: %w", kind, target.ErrUnsupported)
 	}
-	actual, err := auxiliaryEntry(auxv)
+	actual, err := auxiliaryEntryWidth(auxv, word)
 	if err != nil {
 		return 0, err
 	}
@@ -195,15 +206,17 @@ func imageLoadBias(kind elf.Type, entry uint64, auxv []byte) (uint64, error) {
 	return actual - entry, nil
 }
 
-func auxiliaryEntry(data []byte) (uint64, error) {
-	if len(data) == 0 || len(data)%16 != 0 {
+func auxiliaryEntry(data []byte) (uint64, error) { return auxiliaryEntryWidth(data, 8) }
+
+func auxiliaryEntryWidth(data []byte, word int) (uint64, error) {
+	if len(data) == 0 || (word != 4 && word != 8) || len(data)%(2*word) != 0 {
 		return 0, fmt.Errorf("invalid AMD64 auxv length %d: %w", len(data), target.ErrInvalidArgument)
 	}
 	var entry uint64
 	var found, terminated bool
-	for offset := 0; offset < len(data); offset += 16 {
-		key := binary.LittleEndian.Uint64(data[offset : offset+8])
-		value := binary.LittleEndian.Uint64(data[offset+8 : offset+16])
+	for offset := 0; offset < len(data); offset += 2 * word {
+		key := inspectionWord(data[offset : offset+word])
+		value := inspectionWord(data[offset+word : offset+2*word])
 		if terminated {
 			if key != 0 || value != 0 {
 				return 0, fmt.Errorf("nonzero data after AT_NULL: %w", target.ErrInvalidArgument)

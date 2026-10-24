@@ -288,10 +288,10 @@ func TestHeapDWARFCommandsNativeExactMetadata(t *testing.T) {
 					args += fmt.Sprintf(" --debug-file %q", debugFile)
 				}
 				output.Reset()
-				if err := controller.showArenas(ctx, args+" --all"); err != nil || !strings.Contains(output.String(), "observed-arenas=2") || !strings.Contains(output.String(), "arena-address=main_arena-symbol+DWARF") {
+				if err := controller.showArenas(ctx, args+" --all"); err != nil || !strings.Contains(output.String(), "observed-arenas=2") || !strings.Contains(output.String(), "arena[0]") {
 					t.Fatalf("arena error=%v output=%q", err, output.String())
 				}
-				if separate && !strings.Contains(output.String(), "gnu-build-id-metadata") {
+				if separate && strings.Contains(output.String(), "gnu-build-id-metadata") {
 					t.Fatalf("missing debug association proof: %s", output.String())
 				}
 				output.Reset()

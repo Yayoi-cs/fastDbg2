@@ -23,8 +23,8 @@ type commandSpec struct {
 }
 
 var commandSpecs = []commandSpec{
-	{"file", "PATH [ARGS...]", "Configure an AMD64 executable and literal arguments.", nil},
-	{"attach", "PID", "Attach to an existing native AMD64 process.", nil},
+	{"file", "PATH [ARGS...]", "Configure an x86 or AMD64 executable and literal arguments.", nil},
+	{"attach", "PID", "Attach to an existing native x86 or AMD64 process.", nil},
 	{"start", "[ARGS...]", "Start or restart an owned process; stop immediately after exec.", []string{"s", "S", "START"}},
 	{"run", "[ARGS...]", "Start or restart, install breakpoints, then continue.", []string{"r", "R", "RUN"}},
 	{"continue", "[--deliver|--suppress]", "Resume according to scheduler-locking; explicitly decide pending signals.", []string{"c", "cont", "C", "CONTINUE", "CONT"}},
@@ -40,8 +40,8 @@ var commandSpecs = []commandSpec{
 	{"memory", "[--count N] EXPR", "Read raw memory; default 64 bytes, maximum 4096.", nil},
 	{"x", "EXPR", "Examine an explicit address; use x/8xb, x/2i or x/s.", nil},
 	{"disassemble", "[--count N] [EXPR]", "Disassemble confirmed code; default location is selected InstructionPC.", []string{"disass", "disasm"}},
-	{"stack", "[COUNT]", "Show raw qwords at the selected thread's RSP; default 8.", []string{"stk", "STACK", "STK"}},
-	{"backtrace", "[--abi strict|sysv] [COUNT]", "Unwind selected-thread frames using supported, proven AMD64 CFI metadata.", []string{"bt", "BT", "BACKTRACE"}},
+	{"stack", "[COUNT]", "Show native-width words at the selected thread's ESP/RSP; default 8.", []string{"stk", "STACK", "STK"}},
+	{"backtrace", "[--abi strict|sysv] [COUNT]", "Unwind selected-thread frames using supported, proven x86/AMD64 CFI metadata.", []string{"bt", "BT", "BACKTRACE"}},
 	{"stackframe", "[--abi strict|sysv] [INDEX]", "Show the proven CFA and saved-register rules for a CFI frame.", []string{"stkf", "STACKFRAME", "STKF"}},
 	{"hexdump", "UNIT [--count N] EXPR", "Dump byte, word, dword or qword units, with an ASCII column.", []string{"hd"}},
 	{"db", "[--count N] EXPR", "Dump bytes; default 64 units.", nil},
@@ -52,7 +52,7 @@ var commandSpecs = []commandSpec{
 	{"set8", "DEST VALUE", "Write one byte to an explicit memory address.", nil},
 	{"set16", "DEST VALUE", "Write a little-endian 16-bit word to memory.", nil},
 	{"set32", "DEST VALUE", "Write a little-endian 32-bit dword to memory.", nil},
-	{"xor", "DEST KEY", "XOR one confirmed raw qword and write its resulting value.", nil},
+	{"xor", "DEST KEY", "XOR one confirmed native-width word and write its resulting value.", nil},
 	{"wp", "EXPR [OPTIONS] | list | d SLOT", "Manage selected-thread hardware watchpoints and show owned records.", nil},
 	{"simd", "", "Show actual extended-register state for the selected thread.", []string{"SIMD"}},
 	{"xmm", "[INDEX]", "Show SIMD state, or an explicitly selected XMM register.", []string{"XMM"}},
@@ -63,24 +63,25 @@ var commandSpecs = []commandSpec{
 	{"sym", "[FILTER]", "List exact ELF symbol facts; use less on an interactive terminal when available.", []string{"symbol", "SYM", "SYMBOL"}},
 	{"got", "[all|--module EXACT]", "Show confirmed relocation slots and their raw values.", []string{"GOT"}},
 	{"checksec", "[all|--module EXACT|--file PATH]", "Show ELF mitigation-related evidence without inferring runtime protection.", []string{"CHECKSEC"}},
-	{"stdio", "[--module EXACT]", "Dump exact standard-stream symbol objects without guessing FILE layouts.", []string{"stdio-dump", "STDIO", "STDIO-DUMP"}},
+	{"stdio", "[--module EXACT]", "Display standard-stream FILE fields, vtables and wide data.", []string{"stdio-dump", "STDIO", "STDIO-DUMP"}},
+	{"gs_base", "", "Display the selected thread GS base and memory.", []string{"gs", "GS"}},
 	{"fs_base", "", "Show selected-thread FS base and 128 raw bytes at that address.", []string{"fs"}},
 	{"telescope", "[--depth N] EXPR [COUNT]", "Show verified address chains; use less on an interactive terminal when available.", []string{"tel"}},
 	{"search-string", "[OPTIONS] STRING [START [END]]", "Search exact literal bytes in readable mappings.", nil},
 	{"search-value", "[OPTIONS] VALUE [START [END]]", "Search the explicitly encoded integer bytes in readable mappings.", nil},
-	{"findruction", "[OPTIONS] ASM [START [END]]", "Search assembled byte sequences; matches do not prove instruction boundaries.", nil},
+	{"findruction", "[OPTIONS] ASM [START [END]]", "Find instruction bytes with grouped results, disassembly and an interactive browser.", nil},
 	{"cyclic", "LENGTH | -d|-D [OPTIONS] VALUE", "Generate or locate bytes in the lowercase De Bruijn B(26,4) sequence.", nil},
-	{"asm", "INTEL_ASM", "Assemble a literal AMD64 instruction snippet without unresolved relocations.", nil},
-	{"chunk", "--layout glibc-amd64 [--words N] EXPR", "Interpret bytes using an explicitly requested chunk layout.", []string{"CHUNK"}},
-	{"arena", "--layout-file FILE [--all] EXPR | --module EXACT [OPTIONS]", "Inspect arena fields and explicit links using validated layout metadata.", []string{"arenas", "ARENA", "ARENAS"}},
-	{"bins", "--layout-file FILE EXPR | --module EXACT [OPTIONS]", "Inspect declared fastbin and normal-bin links without allocator guesses.", []string{"BINS"}},
-	{"visual-heap", "--layout glibc-amd64 START END", "Walk an explicit chunk-layout range; no heap discovery or allocation inference.", []string{"vis", "VIS", "VISUAL-HEAP"}},
+	{"asm", "INTEL_ASM", "Assemble a literal instruction snippet for the configured x86/amd64 target.", nil},
+	{"chunk", "--layout glibc-amd64|glibc-x86 [--words N] EXPR", "Interpret bytes using an explicitly requested chunk layout.", []string{"CHUNK"}},
+	{"arena", "[--all | -a EXPR] [-n]", "Show main_arena or the selected arena.", []string{"arenas", "ARENA", "ARENAS"}},
+	{"bins", "[--all | -a EXPR] [-v] [-n]", "Show selected-thread tcache and arena bins.", []string{"BINS"}},
+	{"visual-heap", "[-a EXPR] [-n]", "Visualize main_arena or the selected arena.", []string{"vis", "VIS", "VISUAL-HEAP"}},
 	{"color", "", "Show the verified-permission color and modified-register legend.", []string{"COLOR"}},
 	{"!", "SHELL_COMMAND", "Run an explicit shell command; ordinary target arguments remain literal.", nil},
 	{"threads", "", "List known threads and their process identities.", nil},
 	{"thread", "[ID] | tid TID | apply ...", "Select by logical ID, explicitly select by TID, or inspect multiple threads.", []string{"t"}},
 	{"info", "threads | registers [REG...] | breakpoints", "Show thread, register or breakpoint information.", []string{"i"}},
-	{"set", "DEST [=] VALUE | scheduler-locking MODE", "Write a selected register or qword, or set the resume policy.", nil},
+	{"set", "DEST [=] VALUE | scheduler-locking MODE", "Write a selected register or native-width memory word, or set the resume policy.", nil},
 	{"show", "scheduler-locking", "Show the resume policy; recording and replay execution are unsupported.", nil},
 	{"kill", "", "Kill the current target and release the debugger session.", nil},
 	{"detach", "", "Restore breakpoints, deliver pending signals and detach.", nil},
@@ -90,7 +91,7 @@ var commandSpecs = []commandSpec{
 
 func CommandNames() []string {
 	var names []string
-	for _, command := range commandSpecs {
+	for _, command := range append(slices.Clone(commandSpecs), kernelCommandSpecs...) {
 		names = append(names, command.name)
 		names = append(names, command.aliases...)
 	}
@@ -112,7 +113,7 @@ func canonicalCommand(name string) (commandSpec, bool) {
 			return commandSpec{}, false
 		}
 	}
-	for _, command := range commandSpecs {
+	for _, command := range append(slices.Clone(commandSpecs), kernelCommandSpecs...) {
 		if name == command.name || slices.Contains(command.aliases, name) {
 			return command, true
 		}
@@ -146,6 +147,11 @@ func (c *Controller) Configure(path string, args []string) error {
 	if err := preflightAMD64(resolved); err != nil {
 		return err
 	}
+	arch, err := nativePathArchitecture(resolved)
+	if err != nil {
+		return err
+	}
+	c.arch = arch
 	c.path, c.args = resolved, slices.Clone(args)
 	return nil
 }
@@ -167,7 +173,15 @@ func (c *Controller) Execute(ctx context.Context, name, rawArgs string) (bool, e
 	if command.arguments == "" && strings.TrimSpace(rawArgs) != "" {
 		return false, fmt.Errorf("%s takes no arguments: %w", command.name, target.ErrInvalidArgument)
 	}
+
+	if c.qemuMode() && !kernelCommandAvailable(command.name) {
+		return false, fmt.Errorf("%s requires a native userspace process, not a kernel target: %w", command.name, target.ErrUnsupported)
+	}
 	switch command.name {
+	case "pagetable":
+		return false, c.showPageTable(ctx, rawArgs)
+	case "kbase":
+		return false, c.showKernelBase(rawArgs)
 	case "file":
 		args, err := cli.ParseArgs(rawArgs)
 		if err != nil {
@@ -179,7 +193,7 @@ func (c *Controller) Execute(ctx context.Context, name, rawArgs string) (bool, e
 		if err := c.Configure(args[0], args[1:]); err != nil {
 			return false, err
 		}
-		return false, c.writef("Configured native amd64 executable %q with arguments %q\n", c.path, c.args)
+		return false, c.writef("Configured native %s executable %q with arguments %q\n", c.abi().arch, c.path, c.args)
 	case "attach":
 		pid, err := positiveInt(rawArgs, "PID")
 		if err != nil {
@@ -244,6 +258,9 @@ func (c *Controller) Execute(ctx context.Context, name, rawArgs string) (bool, e
 	case "vmmap":
 		return false, c.showVMMap(ctx, rawArgs)
 	case "proc-info":
+		if _, ok := c.session.(*qemuSession); ok {
+			return false, c.showQemuInfo(ctx)
+		}
 		return false, c.showProcInfo(ctx)
 	case "fd":
 		return false, c.showFDs(ctx, rawArgs)
@@ -255,7 +272,12 @@ func (c *Controller) Execute(ctx context.Context, name, rawArgs string) (bool, e
 		return false, c.showChecksec(ctx, rawArgs)
 	case "stdio":
 		return false, c.showStdio(ctx, rawArgs)
+	case "gs_base":
+		return false, c.showSegmentBase(ctx, "gs")
 	case "fs_base":
+		if c.abi().arch == target.X86 {
+			return false, c.showSegmentBase(ctx, "fs")
+		}
 		return false, c.showFSBase(ctx, rawArgs)
 	case "telescope":
 		return false, c.showTelescope(ctx, rawArgs)
@@ -338,8 +360,8 @@ func (c *Controller) refresh() (target.Snapshot, error) {
 	if err != nil {
 		return target.Snapshot{}, err
 	}
-	if snapshot.Architecture != target.AMD64 {
-		return target.Snapshot{}, fmt.Errorf("command interface supports native amd64 only, got %q: %w", snapshot.Architecture, target.ErrUnsupported)
+	if snapshot.Architecture != target.AMD64 && snapshot.Architecture != target.X86 {
+		return target.Snapshot{}, fmt.Errorf("command interface supports native x86 and amd64, got %q: %w", snapshot.Architecture, target.ErrUnsupported)
 	}
 	if c.snapshot.Memory.Space != (target.SpaceRef{}) && c.snapshot.Memory.Space != snapshot.Memory.Space {
 		c.invalidateBreakpoints()
@@ -349,12 +371,18 @@ func (c *Controller) refresh() (target.Snapshot, error) {
 		c.invalidateBreakpoints()
 	}
 	c.snapshot = snapshot
+	c.arch = snapshot.Architecture
 	return snapshot, nil
 }
 
 func (c *Controller) stopped() (target.Snapshot, target.ThreadInfo, error) {
 	if c.active != nil {
 		return target.Snapshot{}, target.ThreadInfo{}, fmt.Errorf("operation completion is unconfirmed; kill or detach for cleanup: %w", target.ErrBusy)
+	}
+	if remote, ok := c.session.(*qemuSession); ok {
+		if err := remote.SelectInspection(c.selected); err != nil {
+			return target.Snapshot{}, target.ThreadInfo{}, err
+		}
 	}
 	snapshot, err := c.refresh()
 	if err != nil {
@@ -449,7 +477,16 @@ func (c *Controller) showHelp(arguments ...string) error {
 	if err := c.writef("%s\n", c.renderer.Text(display.StyleHeading, "Commands:")); err != nil {
 		return err
 	}
-	for _, command := range commandSpecs {
+	for _, command := range append(slices.Clone(commandSpecs), kernelCommandSpecs...) {
+		if c.qemuMode() && !kernelCommandAvailable(command.name) {
+			continue
+		}
+		if !c.qemuMode() && (command.name == "pagetable" || command.name == "kbase") {
+			continue
+		}
+		if c.qemuMode() {
+			command = kernelCommandDescription(command)
+		}
 		name := command.name
 		if len(command.aliases) > 0 {
 			name += " (" + strings.Join(command.aliases, ", ") + ")"
@@ -458,10 +495,19 @@ func (c *Controller) showHelp(arguments ...string) error {
 			return err
 		}
 	}
-	return c.writef("\nNative amd64 only. start stops after exec, not at main; run restarts, continue does not.\nstep/si/stepi execute one instruction, not one source line. Legacy s/S mean start, not GDB source-line step. n/ni/next/finish are not aliases.\nScheduler-locking defaults to replay: normal execution is unlocked; recording/replay is unsupported.\nthread ID selects the logical thread ID; thread tid TID explicitly selects an OS thread ID.\nTarget arguments are literal: quotes and backslash escapes are accepted; no shell expansion is performed except by the explicit ! command.\nExpressions accept integers, $registers and exact symbols from the verified loaded scope.\nBacktick-quote MODULE!NAME or NAME@VERSION; different symbol addresses are ambiguous, never main-first guesses.\nSymbolic breakpoints are re-evaluated on restart and may wait for verified startup loader publication.\n--deliver forwards each resumed thread's pending signal; --suppress explicitly discards those signals.\nMemory commands require explicit addresses except stack and disassemble; x does not remember prior formats or addresses.\nContext is shown at stops by default; context off hides automatic and manual context until context on.\nFull context clears interactive screens; named panes and redirected output do not.\nAn empty interactive line repeats the previous raw command, including failed commands and !; whitespace-only lines are unknown commands. Script blank lines never repeat.\nThe interactive prompt shows the confirmed selected-thread instruction address, or [fastDbg2]$ when unavailable.\nsym and telescope use less on real terminals; pipes print directly. Missing less gives a warning and direct output.\nLaunch uses the debugger's OS stdin/stdout/stderr. Do not share command-script stdin with a target that reads stdin.\nA failed shutdown keeps the session available for cleanup; EOF and termination use the same ownership policy as quit.\nbacktrace/stackframe require supported, proven CFI metadata; no RBP-chain or stack-scan fallback is used.\narena/bins require an explicit validated layout-file and address, or exact module/DWARF metadata with an explicit fast-link policy; no automatic allocator or tcache discovery is performed.\nUse help COMMAND for command syntax, defaults and limits.\n")
+	if c.qemuMode() {
+		return c.writef("\nQEMU system / amd64. Thread IDs identify remote vCPUs, not guest tasks or host PIDs.\nMemory and vmmap use the selected vCPU address space. pt walks actual 4/5-level page tables.\nSymbols use the explicitly supplied vmlinux and --kernel-slide; no KASLR scanning.\nBacktrace uses recognized ORC metadata, or DWARF CFI when ORC is absent; no stack scanning.\nCtrl-C interrupts execution. quit and detach remove owned breakpoints and resume the VM.\nFull context clears interactive screens; Enter repeats the last command; long views use less.\nNative process/libc commands (fd, stdio, arena, bins, vis, attach, kill) do not apply to a kernel target.\n")
+	}
+	return c.writef("\nNative x86 and amd64.\nstart stops after exec, not at main; run restarts, continue does not.\nstep/si/stepi execute one instruction, not one source line. Legacy s/S mean start, not GDB source-line step. n/ni/next/finish are not aliases.\nScheduler-locking defaults to replay: normal execution is unlocked; recording/replay is unsupported.\nthread ID selects the logical thread ID; thread tid TID explicitly selects an OS thread ID.\nTarget arguments are literal: quotes and backslash escapes are accepted; no shell expansion is performed except by the explicit ! command.\nExpressions accept integers, $registers and exact symbols from the verified loaded scope.\nBacktick-quote MODULE!NAME or NAME@VERSION; different symbol addresses are ambiguous, never main-first guesses.\nSymbolic breakpoints are re-evaluated on restart and may wait for verified startup loader publication.\n--deliver forwards each resumed thread's pending signal; --suppress explicitly discards those signals.\nMemory commands require explicit addresses except stack and disassemble; x does not remember prior formats or addresses.\nContext is shown at stops by default; context off hides automatic and manual context until context on.\nFull context clears interactive screens; named panes and redirected output do not.\nAn empty interactive line repeats the previous raw command, including failed commands and !; whitespace-only lines are unknown commands. Script blank lines never repeat.\nThe interactive prompt shows the confirmed selected-thread instruction address, or [fastDbg2]$ when unavailable.\nsym and telescope use less on real terminals; pipes print directly. Missing less gives a warning and direct output.\nLaunch uses the debugger's OS stdin/stdout/stderr. Do not share command-script stdin with a target that reads stdin.\nA failed shutdown keeps the session available for cleanup; EOF and termination use the same ownership policy as quit.\nbacktrace/stackframe require supported, proven CFI metadata; no RBP-chain or stack-scan fallback is used.\narena/bins require an explicit validated layout-file and address, or exact module/DWARF metadata with an explicit fast-link policy; no automatic allocator or tcache discovery is performed.\nUse help COMMAND for command syntax, defaults and limits.\n")
 }
 
 func (c *Controller) showCommandHelp(command commandSpec) error {
+	if c.qemuMode() {
+		command = kernelCommandDescription(command)
+		if detail, ok := kernelCommandDetails[command.name]; ok {
+			return c.writef("Usage: %s %s\n%s\n%s\n", command.name, command.arguments, command.description, detail)
+		}
+	}
 	usage := strings.TrimSpace(command.name + " " + command.arguments)
 	if command.name == "x" {
 		usage = "x/[COUNT][FORMAT][UNIT] EXPR"
@@ -489,12 +535,12 @@ func (c *Controller) showCommandHelp(command commandSpec) error {
 
 const symbolExpressionHelp = " Names are exact, case-sensitive definitions in the verified loaded scope, not substring or main-first choices. Backtick-quote `MODULE!NAME`, `NAME@VERSION` or `MODULE!NAME@VERSION` (module ID, exact path or unique basename; `@@` is unsupported). Same-address aliases collapse; different addresses are ambiguous. Library-local names need a module qualifier. TLS/IFUNC addresses are not guessed. Verified main symbols work at exec; library symbols may await loader publication."
 
-const addressTextHelp = " Visible leaf text is a nonempty, NUL-terminated byte sequence at the exact source address of the displayed qword, or at a readable guard tail too short for a qword. It must terminate within 256 bytes and be valid UTF-8 with every rune satisfying unicode.IsPrint. This is a byte predicate, not a string-type guess or an immediate-register fallback. Quotes and backslashes are escaped; display is bounded to 64 columns including quotes and explicit ellipsis, after the entire bounded string is confirmed. Preview reads reuse confirmed bytes and are separately limited to 32 KiB and 2048 calls per view. Missing terminators, nonprintable bytes, unavailable previews and exhausted preview budgets omit the annotation; stale/cancel discards the view. Pointer chains, cycles, depth limits and required qword errors are unchanged."
+const addressTextHelp = " Visible leaf text is a nonempty, NUL-terminated byte sequence at the exact source address of the displayed native-width word, or at a readable guard tail too short for a native-width word. It must terminate within 256 bytes and be valid UTF-8 with every rune satisfying unicode.IsPrint. This is a byte predicate, not a string-type guess or an immediate-register fallback. Quotes and backslashes are escaped; display is bounded to 64 columns including quotes and explicit ellipsis, after the entire bounded string is confirmed. Preview reads reuse confirmed bytes and are separately limited to 32 KiB and 2048 calls per view. Missing terminators, nonprintable bytes, unavailable previews and exhausted preview budgets omit the annotation; stale/cancel discards the view. Pointer chains, cycles, depth limits and required native-word errors are unchanged."
 const hexRowsHelp = " Rows contain up to 16 bytes and shrink by whole units to fit the terminal width; the requested count and total bytes are unchanged."
 
 var commandDetails = map[string]string{
 	"file":        "PATH and ARGS are literal, with quotes and backslash escapes but no shell expansion. Release a live target before changing files.",
-	"attach":      "PID is a positive decimal OS process ID. Only native little-endian ELF64 AMD64 is supported. Attached targets are detached on quit or EOF.",
+	"attach":      "PID is a positive decimal OS process ID. Native little-endian ELF32 i386 and ELF64 AMD64 are supported. Attached targets are detached on quit or EOF.",
 	"start":       "Stops immediately after exec, not at main. Legacy s/S aliases mean start, not GDB source-line step. Restarts only owned targets. With no arguments, reuses saved target arguments. Resolvable breakpoints are installed; symbolic breakpoints awaiting verified startup loader publication remain pending without advancing past exec.",
 	"run":         "Starts or restarts an owned target, installs resolvable enabled breakpoints, then resumes according to scheduler-locking. Loader-pending symbols are retried at a verified rendezvous; other installation or loader errors prevent automatic resume.",
 	"continue":    "Pending signals on resumed threads require --deliver or --suppress. off/replay/step resume the primary process, including newborn threads; on resumes only the selected thread. Pending symbolic breakpoints are retried at verified loader rendezvous; hard resolution errors return control to the user.",
@@ -504,13 +550,13 @@ var commandDetails = map[string]string{
 	"delete":      "Specify positive decimal breakpoint IDs or the single word all. No arguments is an error. All IDs are validated before changes; native failures retain remaining breakpoint state for cleanup.",
 	"enable":      "Specify one or more positive decimal breakpoint IDs. Enabled expressions are installed in a stopped target or retained pending until a target starts.",
 	"disable":     "Specify one or more positive decimal breakpoint IDs. Restores installed bytes and retains each expression and ID for later enable or restart.",
-	"context":     "With no arguments, shows registers, raw stack values with bounded chains, current code and threads, in that order. Named panes may be regs/registers, stack, code or threads. context on/off enables or hides automatic and manual context (default on); standalone regs and other commands remain available. Full context clears an interactive terminal only after snapshot validation; named panes append without clearing. Default address chains follow at most 4 confirmed qwords in verified readable mappings; exact symbols and permissions are annotated without type/frame or per-thread stop-reason inference. Headers fit the terminal width, defaulting to 100 columns for redirected output." + addressTextHelp,
-	"regs":        "REG names may have an optional $ prefix. -s/--simple shows raw values without mappings, symbols or address-chain reads. The default follows up to 4 confirmed qword links in verified readable mappings, annotates exact symbols and marks cycles. Overlapping true symbol labels are shown as a bounded candidate set, not silently chosen as unique. Register changes are highlighted only across stop/register revisions of the same thread and address space. Unknown or duplicate names are errors; requested order is preserved. Register RIP is raw, not the software-breakpoint instruction address." + addressTextHelp,
+	"context":     "With no arguments, shows registers, raw stack values with bounded chains, current code and threads, in that order. Named panes may be regs/registers, stack, code or threads. context on/off enables or hides automatic and manual context (default on); standalone regs and other commands remain available. Full context clears an interactive terminal only after snapshot validation; named panes append without clearing. Default address chains follow at most 4 confirmed native-width words in verified readable mappings; exact symbols and permissions are annotated without type/frame or per-thread stop-reason inference. Headers fit the terminal width, defaulting to 100 columns for redirected output." + addressTextHelp,
+	"regs":        "REG names may have an optional $ prefix. -s/--simple shows raw values without mappings, symbols or address-chain reads. The default follows up to 4 confirmed native-width links in verified readable mappings, annotates exact symbols and marks cycles. One symbol label is displayed: exact-address matches first, then the shortest label, with lexical tie-breaking. Register changes are highlighted only across stop/register revisions of the same thread and address space. Unknown or duplicate names are errors; requested order is preserved. Register EIP/RIP is raw, not the software-breakpoint instruction address." + addressTextHelp,
 	"print":       "print/p EXPR displays HEX, DEC, OCT and BIN. print/x, /d, /u, /o, /t (also p/...) select hex, signed decimal, unsigned decimal, octal or binary. Constants work without a target; register/symbol expressions require a stopped selected thread. Expressions use checked unsigned 64-bit arithmetic, not GDB C-type width inference; negative literals are unsupported. /d reinterprets the result as int64. Put the format in the command token (p/x, not p /x). No value history is retained." + symbolExpressionHelp,
 	"memory":      "Default 64 bytes; --count is a positive decimal count from 1 through 4096 and must precede EXPR. Displays raw target bytes, including installed software-breakpoint bytes." + symbolExpressionHelp,
 	"x":           "Use x/8xb EXPR for eight hex bytes, x/2i EXPR for two instructions, or x/s EXPR for an explicit string read. Default x is one hexadecimal 32-bit word. COUNT is a positive decimal count; formats x/d/u/o/t/c/i/s and units b/h/w/g are supported. Numeric reads are limited to 4096 bytes; i to 256 instructions; s to 4096 bytes across all requested NUL-terminated strings. c and s support byte units only; i ignores an explicit unit. EXPR is always required; previous formats and addresses are not reused. Code uses logical breakpoint bytes, not inferred instructions.",
-	"disassemble": "EXPR defaults to the selected thread's current InstructionPC. Default 8 instructions, maximum 256; --count N must precede EXPR. Reads confirmed logical code bytes and decodes forward only; raw RIP and InstructionPC remain distinct. No function-boundary or backward decoding inference.",
-	"stack":       "COUNT is a positive decimal number of qwords (default 8, maximum 512). Uses the actual selected thread RSP and raw memory, with RSP/RBP address labels, byte offsets and default chains of at most 4 confirmed qwords through verified readable mappings. Use memory or x for raw-only memory rows. No type or frame inference is performed." + addressTextHelp,
+	"disassemble": "EXPR defaults to the selected thread's current InstructionPC. Default 8 instructions, maximum 256; --count N must precede EXPR. Reads confirmed logical code bytes and decodes forward only; raw RIP/EIP and InstructionPC remain distinct. No function-boundary or backward decoding inference.",
+	"stack":       "COUNT counts native-width words (default 8; maximum 1024 on x86, 512 on amd64). Uses the selected thread ESP/RSP and raw memory, with ESP/EBP or RSP/RBP address labels, byte offsets and default chains of at most 4 confirmed native-width words through verified readable mappings. Use memory or x for raw-only memory rows. No type or frame inference is performed." + addressTextHelp,
 	"hexdump":     "UNIT is byte, word, dword or qword (1, 2, 4 or 8 bytes). Default counts are 64, 32, 16 and 8 respectively. --count N counts units and must precede EXPR; at most 4096 bytes. Displays little-endian units and printable ASCII from confirmed raw bytes." + hexRowsHelp,
 	"db":          "Equivalent to hexdump byte. Default 64 bytes; --count N precedes EXPR, with a 4096-byte maximum." + hexRowsHelp,
 	"dw":          "Equivalent to hexdump word. Default 32 words; --count N precedes EXPR, with a 4096-byte maximum." + hexRowsHelp,

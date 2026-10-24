@@ -79,7 +79,7 @@ func (c *Controller) addBreakpointKind(ctx context.Context, expression string, k
 		}
 		return fmt.Errorf("breakpoint %d %s: %w", bp.id, bp.expressionDescription(), err)
 	}
-	return c.writef("Breakpoint %d installed address=%#x %s\n", bp.id, bp.address, bp.expressionDescription())
+	return c.writef("Breakpoint %d installed address=%s %s\n", bp.id, c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", bp.address)), bp.expressionDescription())
 }
 
 func (c *Controller) breakpointAddress(ctx context.Context, bp *breakpoint, snapshot target.Snapshot, thread target.ThreadInfo) (target.Address, error) {
@@ -89,6 +89,15 @@ func (c *Controller) breakpointAddress(ctx context.Context, bp *breakpoint, snap
 	address, err := c.evaluate(ctx, bp.expression, snapshot, thread)
 	if err != nil || bp.kind == breakpointAbsolute {
 		return address, err
+	}
+	if remote, ok := c.session.(*qemuSession); ok {
+		if remote.image == nil {
+			return 0, target.ErrUnavailable
+		}
+		if uint64(address) > math.MaxUint64-remote.image.slide {
+			return 0, target.ErrOverflow
+		}
+		return target.Address(remote.image.slide + uint64(address)), nil
 	}
 	image, err := c.image.load(ctx, snapshot, thread)
 	if err != nil {
@@ -173,7 +182,7 @@ func (c *Controller) installBreakpoints(ctx context.Context) error {
 			failures = append(failures, fmt.Errorf("breakpoint %d %s: %w", bp.id, bp.expressionDescription(), err))
 			continue
 		}
-		if err := c.writef("Breakpoint %d installed address=%#x %s\n", bp.id, bp.address, bp.expressionDescription()); err != nil {
+		if err := c.writef("Breakpoint %d installed address=%s %s\n", bp.id, c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", bp.address)), bp.expressionDescription()); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
 	}
@@ -207,10 +216,10 @@ func (c *Controller) listBreakpoints() error {
 		}
 		if bp.installed {
 			state = "installed"
-			address = fmt.Sprintf("0x%016x", bp.address)
+			address = fmt.Sprintf("0x%0*x", c.abi().word*2, bp.address)
 		}
 		if bp.attempted {
-			address = fmt.Sprintf("0x%016x", bp.address)
+			address = fmt.Sprintf("0x%0*x", c.abi().word*2, bp.address)
 			if !bp.installed || bp.err != nil {
 				state = "unconfirmed"
 			}
@@ -225,7 +234,10 @@ func (c *Controller) listBreakpoints() error {
 		if bp.kind == breakpointPIE {
 			what += " (PIE offset)"
 		}
-		if err := c.writef("%-4d %-13s %-3s %-18s %-12s %s\n", bp.id, "breakpoint", enabled, address, state, what); err != nil {
+		if bp.installed || bp.attempted {
+			address = c.renderer.Text(display.StyleCyan, address)
+		}
+		if err := c.writef("%-4d %-13s %-3s %s %-12s %s\n", bp.id, "breakpoint", enabled, display.Pad(address, 18), state, what); err != nil {
 			return err
 		}
 		if bp.err != nil {

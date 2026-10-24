@@ -59,7 +59,10 @@ func (c *Controller) showVMMap(ctx context.Context, rawArgs string) error {
 	if len(args) == 1 {
 		filter = args[0]
 	}
-	text, err := renderVMMap(ctx, maps, filter, display.OutputWidth(c.out), c.renderer)
+	if _, ok := c.session.(*qemuSession); ok {
+		return c.showKernelMaps(ctx, snapshot, thread, maps, filter)
+	}
+	text, err := renderVMMap(ctx, maps, filter, display.OutputWidth(c.out), c.renderer, snapshot.Architecture)
 	if err != nil {
 		return err
 	}

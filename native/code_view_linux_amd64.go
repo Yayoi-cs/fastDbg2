@@ -30,8 +30,8 @@ func (e *engine) readCodeLocation(token target.ThreadToken) (CodeLocation, error
 	if err != nil {
 		return CodeLocation{}, err
 	}
-	if t.process.profile.Architecture != target.AMD64 {
-		return CodeLocation{}, fmt.Errorf("code view requires native amd64: %w", target.ErrUnsupported)
+	if t.process.profile.Architecture != target.AMD64 && t.process.profile.Architecture != target.X86 {
+		return CodeLocation{}, fmt.Errorf("code view requires native x86 or amd64: %w", target.ErrUnsupported)
 	}
 	space := t.process.space
 	if space == nil {
@@ -84,8 +84,8 @@ func (e *engine) readCodeMemory(token target.MemoryToken, address target.Address
 	if err != nil {
 		return 0, err
 	}
-	if t.process.profile.Architecture != target.AMD64 {
-		return 0, fmt.Errorf("code view requires native amd64: %w", target.ErrUnsupported)
+	if t.process.profile.Architecture != target.AMD64 && t.process.profile.Architecture != target.X86 {
+		return 0, fmt.Errorf("code view requires native x86 or amd64: %w", target.ErrUnsupported)
 	}
 	if err := validateMemoryRange(t.process.profile, address, len(dst)); err != nil {
 		return 0, err

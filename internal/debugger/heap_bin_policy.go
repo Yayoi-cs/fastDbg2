@@ -9,6 +9,7 @@ import (
 )
 
 type heapBinPolicy struct {
+	Pointer             uint64
 	Alignment           uint64
 	MinChunkSize        uint64
 	SmallBinCount       uint64
@@ -19,9 +20,9 @@ type heapBinPolicy struct {
 }
 
 func (policy heapBinPolicy) valid() bool {
-	return policy.Alignment == 16 && policy.MinChunkSize == 32 &&
+	return (policy.Pointer == 0 || policy.Pointer == 4 || policy.Pointer == 8) && policy.Alignment == 16 && policy.MinChunkSize == policy.word()*4 &&
 		policy.SmallBinCount == 64 && policy.NormalBinCount == 128 &&
-		(policy.FastBinShift == 0 || policy.FastBinShift == 4) &&
+		(policy.FastBinShift == 0 || policy.word() == 8 && policy.FastBinShift == 4 || policy.word() == 4 && policy.FastBinShift == 3) &&
 		policy.TcacheSmallBinCount == 64 && (policy.TcacheLargeBinCount == 0 || policy.TcacheLargeBinCount == 12)
 }
 
@@ -79,11 +80,14 @@ func (policy heapBinPolicy) normalName(index uint64) string {
 }
 
 func (policy heapBinPolicy) largeIndex(size uint64) uint64 {
-	if !policy.valid() || size < policy.SmallBinCount*policy.Alignment || size%policy.Alignment != 0 {
+	if !policy.valid() || size < (policy.SmallBinCount-policy.correction())*policy.Alignment || size%policy.Alignment != 0 {
 		return math.MaxUint64
 	}
+	if policy.correction() == 1 && size>>6 <= 45 {
+		return 49 + (size >> 6)
+	}
 	switch {
-	case size>>6 <= 48:
+	case policy.correction() == 0 && size>>6 <= 48:
 		return 48 + (size >> 6)
 	case size>>9 <= 20:
 		return 91 + (size >> 9)
@@ -103,7 +107,7 @@ func (policy heapBinPolicy) largeRange(index uint64) (uint64, uint64, bool) {
 		return 0, 0, false
 	}
 	first := func(wanted uint64) uint64 {
-		low, high := policy.SmallBinCount, uint64(math.MaxUint64)/policy.Alignment
+		low, high := policy.SmallBinCount-policy.correction(), uint64(math.MaxUint64)/policy.Alignment
 		for low < high {
 			middle := low + (high-low)/2
 			if policy.largeIndex(middle*policy.Alignment) >= wanted {
@@ -141,5 +145,20 @@ func (policy heapBinPolicy) fastRange(index, slots uint64) (uint64, bool) {
 	if !policy.fastSlotsValid(slots) || index >= slots {
 		return 0, false
 	}
-	return policy.MinChunkSize + index*policy.Alignment, true
+	size := policy.MinChunkSize + index*(1<<policy.FastBinShift)
+	return size, size%policy.Alignment == 0
+}
+
+func (policy heapBinPolicy) correction() uint64 {
+	if policy.word() == 4 {
+		return 1
+	}
+	return 0
+}
+
+func (policy heapBinPolicy) word() uint64 {
+	if policy.Pointer == 0 {
+		return 8
+	}
+	return policy.Pointer
 }

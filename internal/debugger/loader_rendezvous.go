@@ -25,6 +25,9 @@ type loaderRendezvousInfo struct {
 }
 
 func (c *Controller) loaderRendezvous(ctx context.Context, snapshot target.Snapshot, thread target.ThreadInfo) (loaderRendezvousInfo, error) {
+	if snapshot.Architecture == target.X86 {
+		return c.x86LoaderRendezvous(ctx, snapshot, thread)
+	}
 	var info loaderRendezvousInfo
 	err := c.withStoppedProc(ctx, snapshot, thread, func(proc *stoppedProc) (err error) {
 		mappings, err := proc.maps()
@@ -159,7 +162,14 @@ func loaderExecutable(memory *runtimeELFMemory, address target.Address, size uin
 	return nil
 }
 
-func readLoaderRendezvous(memory *runtimeELFMemory, address target.Address) (loaderRendezvousInfo, error) {
+func readLoaderRendezvous(memory *runtimeELFMemory, address target.Address, widths ...int) (loaderRendezvousInfo, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
+	if word != 4 && word != 8 {
+		return loaderRendezvousInfo{}, target.ErrInvalidArgument
+	}
 	info := loaderRendezvousInfo{Debug: address, Published: true, Consistent: true}
 	if memory == nil || address == 0 {
 		return loaderRendezvousInfo{}, target.ErrInvalidArgument
@@ -174,7 +184,7 @@ func readLoaderRendezvous(memory *runtimeELFMemory, address target.Address) (loa
 			return loaderRendezvousInfo{}, fmt.Errorf("loader rendezvous namespace limit: %w", target.ErrOverflow)
 		}
 		seen[address] = true
-		data, err := memory.bytes(address, 40)
+		data, err := memory.bytes(address, uint64(word*5))
 		if err != nil {
 			return loaderRendezvousInfo{}, err
 		}
@@ -182,12 +192,12 @@ func readLoaderRendezvous(memory *runtimeELFMemory, address target.Address) (loa
 		if version != 1 && version != 2 {
 			return loaderRendezvousInfo{}, fmt.Errorf("loader rendezvous version %d: %w", version, target.ErrUnsupported)
 		}
-		state := binary.LittleEndian.Uint32(data[24:])
+		state := binary.LittleEndian.Uint32(data[3*word:])
 		if state > 2 {
 			return loaderRendezvousInfo{}, fmt.Errorf("unknown loader rendezvous state %d: %w", state, target.ErrInvalidArgument)
 		}
 		info.Consistent = info.Consistent && state == 0
-		hook := target.Address(binary.LittleEndian.Uint64(data[16:]))
+		hook := target.Address(inspectionWord(data[2*word : 3*word]))
 		if hook == 0 {
 			return loaderRendezvousInfo{}, fmt.Errorf("published loader rendezvous has no r_brk: %w", target.ErrUnavailable)
 		}
@@ -200,15 +210,15 @@ func readLoaderRendezvous(memory *runtimeELFMemory, address target.Address) (loa
 		info.Hook = hook
 		next := target.Address(0)
 		if version == 2 {
-			if uint64(address) > math.MaxUint64-40 {
+			if uint64(address) > math.MaxUint64-uint64(word*5) {
 				return loaderRendezvousInfo{}, target.ErrOverflow
 			}
-			tail, err := memory.bytes(address+40, 8)
+			tail, err := memory.bytes(address+target.Address(word*5), uint64(word))
 			if err != nil {
 				return loaderRendezvousInfo{}, err
 			}
 			data = append(data, tail...)
-			next = target.Address(binary.LittleEndian.Uint64(tail))
+			next = target.Address(inspectionWord(tail))
 		}
 		witnesses = append(witnesses, runtimeELFWitness{address, data})
 		address = next

@@ -2,13 +2,13 @@ package debugger
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strings"
 
+	"fastdbg2/display"
 	"fastdbg2/inspect"
 	"fastdbg2/internal/cli"
 	"fastdbg2/target"
@@ -192,7 +192,10 @@ func (c *Controller) commandSet(ctx context.Context, rawArgs string, bits int) e
 		if err := errors.Join(writeErr, snapshotErr, ctx.Err()); err != nil {
 			return fmt.Errorf("write thread %d register %q: %w", thread.Ref.ID, register.Name, err)
 		}
-		return c.writef("Register write accepted thread=%d tid=%d $%s requested=%#x\n", thread.Ref.ID, thread.TID, register.Name, value)
+		return c.writef("Register write accepted thread=%d tid=%d $%s requested=%s\n", thread.Ref.ID, thread.TID, register.Name, c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", value)))
+	}
+	if bits == 64 {
+		bits = c.abi().bits
 	}
 	address, err := inspect.EvalExpression(destination, resolver)
 	if err != nil {
@@ -205,7 +208,7 @@ func (c *Controller) commandSet(ctx context.Context, rawArgs string, bits int) e
 	if err := c.writeMutationMemory(ctx, snapshot, thread, target.Address(address), data); err != nil {
 		return err
 	}
-	return c.writef("Set memory address=%#x bytes=%d value=%#x\n", address, len(data), value)
+	return c.writef("Set memory address=%s bytes=%d value=%s\n", c.renderer.Text(display.StyleBlue, fmt.Sprintf("%#x", address)), len(data), c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", value)))
 }
 
 func (c *Controller) commandXor(ctx context.Context, rawArgs string) error {
@@ -229,28 +232,33 @@ func (c *Controller) commandXor(ctx context.Context, rawArgs string) error {
 	if err != nil {
 		return err
 	}
-	if err := mutationRange(target.Address(address), 8); err != nil {
+	if err := mutationRange(target.Address(address), c.abi().word); err != nil {
 		return err
 	}
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	var data [8]byte
+	if key > c.abi().maximum {
+		return target.ErrOverflow
+	}
+	data := make([]byte, c.abi().word)
 	n, readErr := c.session.ReadSpaceMemory(snapshot.Memory, target.Address(address), data[:])
 	if n < 0 || n > len(data) {
-		return errors.Join(fmt.Errorf("xor read returned invalid count %d/8: %w", n, target.ErrUnknown), readErr)
+		return errors.Join(fmt.Errorf("xor read returned invalid count %d/%d: %w", n, len(data), target.ErrUnknown), readErr)
 	}
 	if readErr != nil || n != len(data) {
 		if n != len(data) {
 			readErr = errors.Join(readErr, io.ErrUnexpectedEOF)
 		}
-		return fmt.Errorf("xor requires an exact 8-byte read: %d/8 bytes read: %w", n, readErr)
+		return fmt.Errorf("xor requires an exact %d-byte read: %d/%d bytes read: %w", len(data), n, len(data), readErr)
 	}
-	before := binary.LittleEndian.Uint64(data[:])
+	before := inspectionWord(data[:])
 	value := before ^ key
-	binary.LittleEndian.PutUint64(data[:], value)
+	for i := range data {
+		data[i] = byte(value >> (8 * i))
+	}
 	if err := c.writeMutationMemory(ctx, snapshot, thread, target.Address(address), data[:]); err != nil {
 		return err
 	}
-	return c.writef("XOR address=%#x bytes=8: %#x ^ %#x = %#x\n", address, before, key, value)
+	return c.writef("XOR address=%s bytes=%d: %#x ^ %#x = %s\n", c.renderer.Text(display.StyleBlue, fmt.Sprintf("%#x", address)), c.abi().word, before, key, c.renderer.Text(display.StyleCyan, fmt.Sprintf("%#x", value)))
 }

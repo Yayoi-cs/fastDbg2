@@ -92,12 +92,8 @@ func uiBreakpointRowMatches(output string, id uint64, enabled bool, address, sta
 	return len(regexp.MustCompile(pattern).FindAllString(output, -1)) == 1
 }
 
-func uiWatchpointRowMatches(output string, thread uint64, slot int, access string, size int, address target.Address, state string, generation uint64) bool {
-	value := "unknown"
-	if generation != 0 {
-		value = fmt.Sprint(generation)
-	}
-	pattern := fmt.Sprintf(`(?m)^#%d[\t ]+%d[\t ]+%s[\t ]+%d[\t ]+0x%016x[\t ]+%s[\t ]+%s$`, thread, slot, regexp.QuoteMeta(access), size, address, regexp.QuoteMeta(state), value)
+func uiWatchpointRowMatches(output string, thread uint64, slot int, access string, size int, address target.Address, state string, _ uint64) bool {
+	pattern := fmt.Sprintf(`(?m)^#%d[\t ]+%d[\t ]+%s[\t ]+%d[\t ]+0x%016x[\t ]+%s$`, thread, slot, regexp.QuoteMeta(access), size, address, regexp.QuoteMeta(state))
 	return len(regexp.MustCompile(pattern).FindAllString(output, -1)) == 1
 }
 

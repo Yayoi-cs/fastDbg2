@@ -16,6 +16,15 @@ func disassembleX86(start target.Address, code []byte, limit int) ([]Instruction
 	var result []Instruction
 	for offset := 0; offset < len(code) && (limit == 0 || len(result) < limit); {
 		address := start + target.Address(offset)
+		if len(code)-offset >= 4 && code[offset] == 0xf3 && code[offset+1] == 0x0f && code[offset+2] == 0x1e && (code[offset+3] == 0xfb || code[offset+3] == 0xfa) {
+			name := "endbr32"
+			if code[offset+3] == 0xfa {
+				name = "endbr64"
+			}
+			result = append(result, Instruction{Address: address, Bytes: slices.Clone(code[offset : offset+4]), Text: name})
+			offset += 4
+			continue
+		}
 		inst, err := x86asm.Decode(code[offset:], 32)
 		if err != nil {
 			return result, fmt.Errorf("decode at %#x: %w", address, err)

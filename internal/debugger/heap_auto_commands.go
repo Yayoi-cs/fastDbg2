@@ -122,7 +122,7 @@ func heapPolicyForAllocator(allocator *allocatorContext) (heapBinPolicy, error) 
 	if allocator == nil {
 		return heapBinPolicy{}, target.ErrInvalidArgument
 	}
-	policy := heapBinPolicy{
+	policy := heapBinPolicy{Pointer: allocator.Layout.Pointer,
 		Alignment: allocator.Alignment, MinChunkSize: allocator.MinChunkSize,
 		SmallBinCount: allocator.SmallBinCount, NormalBinCount: allocator.NormalBinCount,
 		FastBinShift: allocator.FastBinShift, TcacheSmallBinCount: allocator.TcacheSmallBinCount,
@@ -131,7 +131,7 @@ func heapPolicyForAllocator(allocator *allocatorContext) (heapBinPolicy, error) 
 	if err := policy.validate(); err != nil {
 		return heapBinPolicy{}, err
 	}
-	if allocator.ChunkHeaderSize != 16 || allocator.SizeFlags != 7 || allocator.Layout.Tcache == nil || allocator.Layout.TcacheEntry == nil {
+	if allocator.ChunkHeaderSize != 2*allocator.Layout.Pointer || allocator.SizeFlags != 7 || allocator.Layout.Tcache == nil || allocator.Layout.TcacheEntry == nil {
 		return heapBinPolicy{}, fmt.Errorf("allocator chunk or tcache ABI is not proven: %w", target.ErrUnsupported)
 	}
 	mode := allocator.Semantics.TcacheCounterMode
@@ -231,16 +231,16 @@ func validateAutomaticBins(allocator *allocatorContext, input heapGraphInput, ob
 				continue
 			}
 			size := raw &^ allocator.SizeFlags
-			valid := size >= allocator.MinChunkSize && size%allocator.Alignment == 0 && raw&2 == 0 && uint64(node.address)%allocator.Alignment == 0 && size <= math.MaxUint64-uint64(node.address)
+			valid := size >= allocator.MinChunkSize && size%allocator.Alignment == 0 && raw&2 == 0 && (uint64(node.address)+allocator.ChunkHeaderSize)%allocator.Alignment == 0 && size <= math.MaxUint64-uint64(node.address)
 			if bin.fast {
 				index, classOK := policy.fastIndex(size, input.layout.Arena.Fields["fastbinsY"].Count)
 				valid = valid && classOK && index == bin.index
 			} else {
 				switch policy.normalName(bin.index) {
 				case "small":
-					valid = valid && size == bin.index*allocator.Alignment
+					valid = valid && size == (bin.index-policy.correction())*allocator.Alignment
 				case "large":
-					valid = valid && size >= policy.SmallBinCount*policy.Alignment && policy.largeIndex(size) == bin.index
+					valid = valid && size >= (policy.SmallBinCount-policy.correction())*policy.Alignment && policy.largeIndex(size) == bin.index
 				case "reserved":
 					valid = false
 				}
@@ -276,12 +276,12 @@ func collectAutomaticHeap(allocator *allocatorContext, input heapGraphInput, all
 		for index := range tcache.bins {
 			bin := &tcache.bins[index]
 			bin.sizeMin, bin.sizeMax, _ = policy.tcacheRange(bin.index)
-			for _, node := range bin.nodes {
+			for position, node := range bin.nodes {
 				if !node.linked || !node.chunkKnown {
 					continue
 				}
 				address := node.chunkAddress
-				label := fmt.Sprintf("tcache[%d] thread=%d TID=%d", bin.index, allocator.ThreadRef.ID, allocator.TID)
+				label := fmt.Sprintf("tcache[idx=%d sz=0x%x][%d/%d]", bin.index, node.chunkSize, position+1, len(bin.nodes))
 				result.members[address] = append(result.members[address], heapVisualMembership{Label: label, Complete: bin.complete && bin.err == nil})
 			}
 		}
@@ -327,14 +327,15 @@ func collectAutomaticHeap(allocator *allocatorContext, input heapGraphInput, all
 			return heapAutomaticObservation{}, err
 		}
 		for _, bin := range observation.bins {
-			for _, node := range bin.nodes {
+			for position, node := range bin.nodes {
 				if !node.linked {
 					continue
 				}
-				label := fmt.Sprintf("%s[%d] arena=0x%x", policy.normalName(bin.index), bin.index, address)
+				kind := policy.normalName(bin.index)
 				if bin.fast {
-					label = fmt.Sprintf("fastbin[%d] arena=0x%x", bin.index, address)
+					kind = "fastbin"
 				}
+				label := fmt.Sprintf("%s[idx=%d][%d/%d]", kind, bin.index, position+1, len(bin.nodes))
 				result.members[node.address] = append(result.members[node.address], heapVisualMembership{Label: label, Complete: bin.complete})
 			}
 		}
@@ -352,7 +353,7 @@ func formatAutomaticBins(ctx context.Context, observation heapAutomaticObservati
 	var output strings.Builder
 	allocator, input := observation.allocator, observation.input
 	fmt.Fprintf(&output, "%s\n", renderer.Text(display.StyleHeading, "[glibc bins]"))
-	fmt.Fprintf(&output, "selected thread=%d TID=%d; tcache is thread-local and is displayed separately from arenas.\n", allocator.ThreadRef.ID, allocator.TID)
+	fmt.Fprintf(&output, "Thread %d (tid %d)\n", allocator.ThreadRef.ID, allocator.TID)
 	if observation.tcache != nil {
 		text, err := formatHeapTcache(ctx, input, *observation.tcache, renderer, verbose)
 		if err != nil {
@@ -360,7 +361,7 @@ func formatAutomaticBins(ctx context.Context, observation heapAutomaticObservati
 		}
 		output.WriteString(text)
 	} else {
-		fmt.Fprintf(&output, "%s\ntcache=0x%016x state=%s\n", renderer.Text(display.StyleHeading, "[tcache]"), allocator.Tcache, strconv.Quote(allocator.TcacheState))
+		fmt.Fprintf(&output, "%s\ntcache=0x%0*x state=%s\n", renderer.Text(display.StyleHeading, "[tcache]"), allocator.Layout.Pointer*2, allocator.Tcache, strconv.Quote(allocator.TcacheState))
 	}
 	for _, arena := range observation.arenas {
 		if err := contextReady(ctx); err != nil {
@@ -370,14 +371,14 @@ func formatAutomaticBins(ctx context.Context, observation heapAutomaticObservati
 		if arena.arena.address == allocator.MainArena {
 			kind = "main_arena"
 		}
-		address, _ := renderer.Address(target.AMD64, arena.arena.address, display.AddressHeap)
+		address, _ := renderer.Address(target.Architecture(allocator.Layout.Arch), arena.arena.address, display.AddressHeap)
 		fmt.Fprintf(&output, "%s\n", renderer.Text(display.StyleHeading, fmt.Sprintf("[%s %s]", kind, address)))
 		top, topKnown := heapGraphField(arena.arena.data, input.layout.Arena.Fields["top"], 0)
 		if topKnown {
-			fmt.Fprintf(&output, "top=0x%016x\n", top)
+			fmt.Fprintf(&output, "top=0x%0*x\n", allocator.Layout.Pointer*2, top)
 		}
 		if topKnown && top == 0 && len(arena.bins) == 0 {
-			output.WriteString("Arena initialization is not complete; no bin-chain emptiness is inferred.\n")
+			output.WriteString("Arena is not initialized.\n")
 			continue
 		}
 		for _, group := range []string{"fast", "unsorted", "small", "large", "reserved"} {
@@ -420,7 +421,7 @@ func formatAutomaticBins(ctx context.Context, observation heapAutomaticObservati
 					fmt.Fprintf(&output, " bin=%d", bin.index)
 				}
 				if group == "small" {
-					fmt.Fprintf(&output, " size=0x%x", bin.index*allocator.Alignment)
+					fmt.Fprintf(&output, " size=0x%x", (bin.index-policy.correction())*allocator.Alignment)
 				} else if group == "fast" {
 					if size, ok := policy.fastRange(bin.index, input.layout.Arena.Fields["fastbinsY"].Count); ok {
 						fmt.Fprintf(&output, " size=0x%x", size)
@@ -430,18 +431,18 @@ func formatAutomaticBins(ctx context.Context, observation heapAutomaticObservati
 						fmt.Fprintf(&output, " size=0x%x-0x%x", minimum, maximum)
 					}
 				}
-				fmt.Fprintf(&output, "] head=0x%016x observed=%d complete=%t\n", bin.head, len(bin.nodes), bin.complete)
+				fmt.Fprintf(&output, "] head=0x%0*x count=%d\n", allocator.Layout.Pointer*2, bin.head, len(bin.nodes))
 				for _, node := range bin.nodes {
-					address, _ := renderer.Address(target.AMD64, node.address, display.AddressHeap)
+					address, _ := renderer.Address(target.Architecture(allocator.Layout.Arch), node.address, display.AddressHeap)
 					fmt.Fprintf(&output, "    -> %s", address)
 					if value, ok := heapGraphField(node.data, input.layout.Chunk.Fields["mchunk_size"], 0); ok {
 						fmt.Fprintf(&output, " size=0x%x", value&^allocator.SizeFlags)
 					}
 					if node.linked {
 						if bin.fast {
-							fmt.Fprintf(&output, " fd.stored=0x%016x next=0x%016x", node.stored, node.next)
+							fmt.Fprintf(&output, " fd.stored=0x%0*x next=0x%0*x", allocator.Layout.Pointer*2, node.stored, allocator.Layout.Pointer*2, node.next)
 						} else {
-							fmt.Fprintf(&output, " fd=0x%016x bk=0x%016x", node.next, node.back)
+							fmt.Fprintf(&output, " fd=0x%0*x bk=0x%0*x", allocator.Layout.Pointer*2, node.next, allocator.Layout.Pointer*2, node.back)
 						}
 					} else {
 						fmt.Fprintf(&output, " <incomplete: %d confirmed bytes>", len(node.data))
@@ -456,7 +457,7 @@ func formatAutomaticBins(ctx context.Context, observation heapAutomaticObservati
 				if total == 0 {
 					output.WriteString("  (not examined)\n")
 				} else {
-					fmt.Fprintf(&output, "  (%d observed empty lists)\n", total)
+					fmt.Fprintf(&output, "  (empty)\n")
 				}
 			}
 		}
@@ -517,8 +518,9 @@ func (c *Controller) showAutomaticArenas(ctx context.Context, rawArgs string) er
 	}
 	var output strings.Builder
 	fmt.Fprintf(&output, "%s\n", c.renderer.Text(display.StyleHeading, "[arenas]"))
-	fmt.Fprintf(&output, "selected thread=%d TID=%d; * marks its thread_arena TLS value, attached is a raw allocator counter.\n", allocator.ThreadRef.ID, allocator.TID)
-	output.WriteString("  Kind        Arena              Top                System memory      Attached  Next\n")
+	fmt.Fprintf(&output, "Thread %d (tid %d), * current arena\n", allocator.ThreadRef.ID, allocator.TID)
+	columns := max(13, int(allocator.Layout.Pointer)*2+2)
+	fmt.Fprintf(&output, "  %-11s %-*s %-*s %-*s %-9s %s\n", "Kind", columns, "Arena", columns, "Top", columns, "System memory", "Attached", "Next")
 	for _, arena := range arenas {
 		if err := contextReady(ctx); err != nil {
 			return err
@@ -538,15 +540,14 @@ func (c *Controller) showAutomaticArenas(ctx context.Context, rawArgs string) er
 					if name == "attached_threads" {
 						values[index] = strconv.FormatUint(value, 10)
 					} else {
-						values[index] = fmt.Sprintf("0x%016x", value)
+						values[index] = fmt.Sprintf("0x%0*x", allocator.Layout.Pointer*2, value)
 					}
 				}
 			}
 		}
-		address, _ := c.renderer.Address(target.AMD64, arena.address, display.AddressHeap)
-		fmt.Fprintf(&output, "%s %-11s %s %s %s %-9s %s\n", marker, kind, address, values[0], values[1], values[2], values[3])
+		address, _ := c.renderer.Address(c.abi().arch, arena.address, display.AddressHeap)
+		fmt.Fprintf(&output, "%s %-11s %s %s %s %-9s %s\n", marker, kind, display.Pad(address, columns), display.Pad(values[0], columns), display.Pad(values[1], columns), values[2], values[3])
 	}
-	fmt.Fprintf(&output, "observed-arenas=%d\n", len(arenas))
 	return c.publishAutomaticHeap(ctx, output.String(), err, arguments.noPager)
 }
 
@@ -563,7 +564,7 @@ func (c *Controller) showAutomaticVisualHeap(ctx context.Context, rawArgs string
 			return err
 		}
 		if len(extents) == 0 {
-			empty = "[visual-heap]\nNo initialized heap extent was observed for this arena.\n"
+			empty = "Heap is not initialized.\n"
 			return nil
 		}
 		bins, binErr := collectAutomaticHeap(allocator, input, false)

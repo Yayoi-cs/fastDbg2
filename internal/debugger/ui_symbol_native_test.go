@@ -60,7 +60,7 @@ func TestUINativeLibcSymbolAnnotationsUseVerifiedLoadedFacts(t *testing.T) {
 					t.Fatalf("%s address annotations unavailable: %v", name, err)
 				}
 				label := walker.symbol(location.InstructionPC)
-				if !slices.Contains(strings.Split(label, " | "), name) {
+				if label != name {
 					t.Fatalf("%s exact libc label absent: %q", name, label)
 				}
 				if label := walker.symbol(0); label != "" {

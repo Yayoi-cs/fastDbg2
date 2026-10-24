@@ -128,7 +128,7 @@ func (c *Controller) examineRows(address target.Address, data []byte, format exa
 	}
 	for offset := 0; offset < len(data); offset += width {
 		row := data[offset:min(offset+width, len(data))]
-		addressText, err := c.renderer.Address(target.AMD64, address+target.Address(offset), display.AddressUnknown)
+		addressText, err := c.renderer.Address(c.abi().arch, address+target.Address(offset), display.AddressUnknown)
 		if err != nil {
 			return err
 		}
@@ -196,7 +196,7 @@ func (c *Controller) showExamineStrings(ctx context.Context, token target.Memory
 }
 
 func (c *Controller) examineString(address target.Address, data []byte, terminated bool) error {
-	addressText, err := c.renderer.Address(target.AMD64, address, display.AddressUnknown)
+	addressText, err := c.renderer.Address(c.abi().arch, address, display.AddressUnknown)
 	if err != nil {
 		return err
 	}

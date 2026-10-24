@@ -138,11 +138,15 @@ func TestDisassembleAMD64EndbranchAddressBounds(t *testing.T) {
 	}
 }
 
-func TestDisassembleEndbranchDoesNotChangeX86Decoder(t *testing.T) {
+func TestDisassembleEndbranchX86(t *testing.T) {
 	for _, last := range []byte{0xfa, 0xfb} {
 		result, err := inspect.Disassemble(target.X86, 0x1000, []byte{0xf3, 0x0f, 0x1e, last}, 0)
-		if !errors.Is(err, target.ErrUnavailable) || len(result) != 0 {
-			t.Fatalf("32-bit decoder changed: result=%+v error=%v", result, err)
+		name := "endbr32"
+		if last == 0xfa {
+			name = "endbr64"
+		}
+		if err != nil || len(result) != 1 || result[0].Text != name || len(result[0].Bytes) != 4 {
+			t.Fatalf("32-bit ENDBR decode: result=%+v error=%v", result, err)
 		}
 	}
 }

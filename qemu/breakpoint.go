@@ -47,3 +47,49 @@ func (s *Session) removeBreakpoint(addr target.Address) error {
 	delete(s.breakpoints, addr)
 	return nil
 }
+
+type HardwarePoint struct {
+	Kind    int
+	Address target.Address
+	Size    int
+}
+
+func (s *Session) AddHardwarePoint(point HardwarePoint) error {
+	if point.Kind < 1 || point.Kind > 4 || point.Size < 1 || point.Size > 8 || point.Size&(point.Size-1) != 0 || !validRange(point.Address, point.Size) {
+		return target.ErrInvalidArgument
+	}
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	if s.hardwarePoints[point] {
+		return nil
+	}
+	s.changed()
+	if err := s.expectOK(fmt.Sprintf("Z%d,%x,%x", point.Kind, point.Address, point.Size)); err != nil {
+		return err
+	}
+	if s.hardwarePoints == nil {
+		s.hardwarePoints = make(map[HardwarePoint]bool)
+	}
+	s.hardwarePoints[point] = true
+	return nil
+}
+func (s *Session) RemoveHardwarePoint(point HardwarePoint) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.removeHardwarePoint(point)
+}
+func (s *Session) removeHardwarePoint(point HardwarePoint) error {
+	if !s.hardwarePoints[point] {
+		return target.ErrNotFound
+	}
+	s.changed()
+	if err := s.expectOK(fmt.Sprintf("z%d,%x,%x", point.Kind, point.Address, point.Size)); err != nil {
+		return err
+	}
+	delete(s.hardwarePoints, point)
+	return nil
+}

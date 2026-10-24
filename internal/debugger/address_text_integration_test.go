@@ -75,12 +75,12 @@ func TestAddressTextNativeSharedViewsKeepSnapshotAndRawWords(t *testing.T) {
 			if output := fixture.command(t, "regs -s r12"); strings.Contains(output, "'") || strings.Contains(output, " -> ") {
 				t.Fatalf("simple registers acquired text previews: %s", output)
 			}
-			if output := fixture.command(t, "tel text_shell 1"); !strings.Contains(output, "0x622f3d4c4c454853 'SHELL=/bin/bash'") || strings.Count(output, "\n") != 2 {
+			if output := fixture.command(t, "tel text_shell 1"); !strings.Contains(output, "0x622f3d4c4c454853 'SHELL=/bin/bash'") || strings.Count(output, "\n") != 1 {
 				t.Fatalf("direct telescope changed logical rows: %s", output)
 			}
 			output := fixture.command(t, "tel text_rows 8")
 			rows := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
-			if len(rows) != 9 || !strings.HasSuffix(rows[4], "'A'") || !strings.HasSuffix(rows[5], "'END'") || strings.Contains(rows[6], "'") || strings.Contains(rows[7], "'") || !strings.HasSuffix(rows[8], "'"+strings.Repeat("A", 59)+"'...") {
+			if len(rows) != 8 || !strings.HasSuffix(rows[3], "'A'") || !strings.HasSuffix(rows[4], "'END'") || strings.Contains(rows[5], "'") || strings.Contains(rows[6], "'") || !strings.HasSuffix(rows[7], "'"+strings.Repeat("A", 59)+"'...") {
 				t.Fatalf("native positive/negative text predicates: %s", output)
 			}
 			after, err := fixture.controller.session.Snapshot()

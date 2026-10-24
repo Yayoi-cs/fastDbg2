@@ -37,10 +37,8 @@ func (r Renderer) Address(arch target.Architecture, address target.Address, kind
 		code = codeColor
 	case AddressData:
 		code = "36"
-	case AddressStack:
-		code = "33"
-	case AddressHeap:
-		code = "35"
+	case AddressStack, AddressHeap:
+		code = "36"
 	default:
 		return "", fmt.Errorf("address kind %d: %w", kind, target.ErrInvalidArgument)
 	}

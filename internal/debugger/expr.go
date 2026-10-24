@@ -72,5 +72,8 @@ func (c *Controller) evaluate(ctx context.Context, expression string, snapshot t
 		symbols:   symbols.Resolve,
 	}
 	value, err := inspect.EvalExpression(expression, resolver)
+	if err == nil && value > abiFor(snapshot.Architecture).maximum {
+		return 0, target.ErrOverflow
+	}
 	return target.Address(value), err
 }

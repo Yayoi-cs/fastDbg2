@@ -11,19 +11,24 @@ import (
 	"fastdbg2/target"
 )
 
-type AMD64UnwindRegisters struct {
-	Values [17]uint64
-	Known  uint32
+type AMD64UnwindRegisters = UnwindRegisters
+type UnwindRegisters struct {
+	Architecture target.Architecture
+	Values       [17]uint64
+	Known        uint32
 }
 
-type AMD64UnwindProfile uint8
+type AMD64UnwindProfile = UnwindProfile
+type UnwindProfile uint8
 
 const (
 	UnwindStrictCFI AMD64UnwindProfile = iota
 	UnwindSysVAMD64
+	UnwindSysVX86
 )
 
-type AMD64UnwindRequest struct {
+type AMD64UnwindRequest = UnwindRequest
+type UnwindRequest struct {
 	Profile   AMD64UnwindProfile
 	Registers AMD64UnwindRegisters
 	PC        target.Address
@@ -39,6 +44,8 @@ type UnwindResult struct {
 }
 
 type UnwindFrame struct {
+	MetadataKind  string
+	CFARule       string
 	PC            target.Address
 	RawPC         target.Address
 	LookupPC      target.Address
@@ -82,10 +89,25 @@ func (e *UnwindLimitError) Is(err error) bool { return err == target.ErrPartial 
 var amd64UnwindNames = [...]string{"rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"}
 
 func AMD64UnwindRegistersFromTarget(registers []target.Register) (AMD64UnwindRegisters, error) {
+	return UnwindRegistersFromTarget(target.AMD64, registers)
+}
+
+func UnwindRegistersFromTarget(arch target.Architecture, registers []target.Register) (AMD64UnwindRegisters, error) {
+	names := amd64UnwindNames[:]
+	word := 8
+	if arch == target.X86 {
+		names = x86UnwindNames[:]
+		word = 4
+	} else if arch != target.AMD64 {
+		return AMD64UnwindRegisters{}, target.ErrUnsupported
+	}
 	var result AMD64UnwindRegisters
+	if arch == target.X86 {
+		result.Architecture = arch
+	}
 	var seen uint32
 	for _, register := range registers {
-		for number, name := range amd64UnwindNames {
+		for number, name := range names {
 			if register.Name != name {
 				continue
 			}
@@ -97,10 +119,12 @@ func AMD64UnwindRegistersFromTarget(registers []target.Register) (AMD64UnwindReg
 			if !register.Available {
 				break
 			}
-			if register.Bits != 64 || len(register.Data) != 8 {
+			if register.Bits != word*8 || len(register.Data) != word {
 				return AMD64UnwindRegisters{}, fmt.Errorf("invalid AMD64 register %s: %w", name, target.ErrInvalidArgument)
 			}
-			result.Values[number] = binary.LittleEndian.Uint64(register.Data)
+			var data [8]byte
+			copy(data[:], register.Data)
+			result.Values[number] = binary.LittleEndian.Uint64(data[:])
 			result.Known |= bit
 			break
 		}
@@ -109,6 +133,7 @@ func AMD64UnwindRegistersFromTarget(registers []target.Register) (AMD64UnwindReg
 }
 
 type unwindBudget struct {
+	arch       target.Architecture
 	operations int
 	bytes      int
 	read       CFIReader
@@ -133,6 +158,9 @@ func (b *unwindBudget) charge(ctx context.Context, cost int) error {
 func (b *unwindBudget) memory(ctx context.Context, address target.Address, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if b.arch == target.X86 && (address > math.MaxUint32 || len(data) > 0 && uint64(len(data)-1) > math.MaxUint32-uint64(address)) {
+		return target.ErrOverflow
 	}
 	if len(data) > b.bytes || len(data) != 0 && uint64(len(data)-1) > math.MaxUint64-uint64(address) {
 		return fmt.Errorf("unwind memory budget or range: %w", target.ErrOverflow)
@@ -177,7 +205,11 @@ func unwindError(result UnwindResult, err error) (UnwindResult, error) {
 	return result, err
 }
 
-func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (result UnwindResult, err error) {
+func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (UnwindResult, error) {
+	return Unwind(ctx, request)
+}
+
+func Unwind(ctx context.Context, request UnwindRequest) (result UnwindResult, err error) {
 	if ctx == nil {
 		return UnwindResult{}, target.ErrInvalidArgument
 	}
@@ -189,13 +221,20 @@ func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (result Unwind
 			result = UnwindResult{}
 		}
 	}()
-	if request.Find == nil || request.MaxFrames < 1 || request.MaxFrames > 256 || request.Registers.Known>>17 != 0 || request.Profile > UnwindSysVAMD64 {
+	abi := unwindABIFor(request.Registers.Architecture)
+	if abi.word == 4 && request.PC > math.MaxUint32 {
+		return result, target.ErrOverflow
+	}
+	if request.Find == nil || request.MaxFrames < 1 || request.MaxFrames > 256 || request.Registers.Known>>abi.count != 0 || request.Profile > UnwindSysVX86 {
+		return UnwindResult{}, target.ErrInvalidArgument
+	}
+	if request.Registers.Architecture != "" && request.Registers.Architecture != target.AMD64 && request.Registers.Architecture != target.X86 || request.Profile == UnwindSysVX86 && abi.word != 4 || request.Profile == UnwindSysVAMD64 && abi.word != 8 {
 		return UnwindResult{}, target.ErrInvalidArgument
 	}
 	if err := ctx.Err(); err != nil {
 		return UnwindResult{}, err
 	}
-	if request.Registers.Known&(1<<16) == 0 {
+	if request.Registers.Known&(1<<abi.pc) == 0 {
 		return UnwindResult{}, fmt.Errorf("initial RIP: %w", target.ErrUnavailable)
 	}
 	type identity struct {
@@ -205,7 +244,7 @@ func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (result Unwind
 	}
 	seen := make(map[identity]struct{})
 	registers, pc, isReturn := request.Registers, request.PC, false
-	budget := &unwindBudget{operations: 1 << 20, bytes: 1 << 20, read: request.Read, profile: request.Profile}
+	budget := &unwindBudget{operations: 1 << 20, bytes: 1 << 20, read: request.Read, profile: request.Profile, arch: request.Registers.Architecture}
 	for {
 		if err := budget.operation(ctx); err != nil {
 			return unwindError(result, err)
@@ -222,7 +261,7 @@ func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (result Unwind
 			}
 			lookup--
 		}
-		result.Frames = append(result.Frames, UnwindFrame{PC: pc, RawPC: target.Address(registers.Values[16]), LookupPC: lookup, ReturnPC: isReturn, Registers: registers})
+		result.Frames = append(result.Frames, UnwindFrame{PC: pc, RawPC: target.Address(registers.Values[abi.pc]), LookupPC: lookup, ReturnPC: isReturn, Registers: registers})
 		frame := &result.Frames[len(result.Frames)-1]
 		metadata, err := request.Find(ctx, lookup)
 		if err != nil {
@@ -238,7 +277,7 @@ func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (result Unwind
 		}
 		evaluation := registers
 		if len(result.Frames) == 1 {
-			evaluation.Values[16] = uint64(pc)
+			evaluation.Values[abi.pc] = uint64(pc)
 		}
 		next, complete, err := recoverCFIFrame(ctx, metadata, row, evaluation, frame, budget)
 		if err != nil {
@@ -255,7 +294,7 @@ func UnwindAMD64(ctx context.Context, request AMD64UnwindRequest) (result Unwind
 			result.Limited = true
 			return result, &UnwindLimitError{Limit: request.MaxFrames}
 		}
-		registers, pc, isReturn = next, target.Address(next.Values[16]), !metadata.cie.signal
+		registers, pc, isReturn = next, target.Address(next.Values[abi.pc]), !metadata.cie.signal
 	}
 }
 
@@ -293,6 +332,13 @@ type unwindRow struct {
 
 func initialAMD64Row(profile AMD64UnwindProfile) unwindRow {
 	row := unwindRow{rules: make(map[uint64]unwindRule)}
+	if profile == UnwindSysVX86 {
+		for _, r := range []uint64{3, 5, 6, 7} {
+			row.rules[r] = unwindRule{kind: unwindSame}
+		}
+		row.rules[4] = unwindRule{kind: unwindValueOffset}
+		return row
+	}
 	if profile != UnwindSysVAMD64 {
 		return row
 	}
@@ -312,8 +358,8 @@ func cloneUnwindRow(row unwindRow) unwindRow {
 }
 
 func evaluateCFIRow(ctx context.Context, frame *CFIFrame, pc target.Address, budget *unwindBudget) (unwindRow, error) {
-	if frame.cie.addressSize != 8 || frame.cie.returnRegister != 16 || frame.cie.codeAlign == 0 {
-		return unwindRow{}, fmt.Errorf("unsupported AMD64 CIE address/return-register/alignment: %w", target.ErrUnsupported)
+	if int(frame.cie.addressSize) != unwindABIFor(budget.arch).word || frame.cie.returnRegister != uint64(unwindABIFor(budget.arch).pc) || frame.cie.codeAlign == 0 {
+		return unwindRow{}, fmt.Errorf("unsupported CIE address/return-register/alignment for target ABI: %w", target.ErrUnsupported)
 	}
 	initial := initialAMD64Row(budget.profile)
 	initial, err := runCFIProgram(ctx, frame, frame.cie.initial, cloneUnwindRow(initial), initial, frame.start, pc, true, budget)
@@ -436,7 +482,7 @@ func runCFIProgram(ctx context.Context, frame *CFIFrame, program cfiProgram, row
 			case 0x01:
 				advance = true
 				if frame.debug {
-					value := reader.fixed(8)
+					value := reader.fixed(unwindABIFor(budget.arch).word)
 					if frame.loadBias > math.MaxUint64-value {
 						reader.err = target.ErrOverflow
 					} else {
@@ -444,7 +490,7 @@ func runCFIProgram(ctx context.Context, frame *CFIFrame, program cfiProgram, row
 					}
 				} else {
 					function := uint64(frame.start)
-					value, e := cfiDecodePointer(ctx, reader.data, &reader.offset, program.address, frame.cie.pointerEncoding, cfiPointerBases{function: &function}, func(ctx context.Context, address target.Address, data []byte) (int, error) {
+					value, e := cfiDecodePointer(ctx, reader.data, &reader.offset, program.address, frame.cie.pointerEncoding, cfiPointerBases{word: unwindABIFor(budget.arch).word, function: &function}, func(ctx context.Context, address target.Address, data []byte) (int, error) {
 						if e := budget.memory(ctx, address, data); e != nil {
 							return 0, e
 						}
@@ -564,14 +610,16 @@ func unwindRegisterValue(registers AMD64UnwindRegisters, number uint64) (uint64,
 		return 0, fmt.Errorf("required DWARF register %d: %w", number, target.ErrUnsupported)
 	}
 	if registers.Known&(1<<number) == 0 {
-		return 0, fmt.Errorf("DWARF register %d (%s): %w", number, amd64UnwindNames[number], target.ErrUnavailable)
+		return 0, fmt.Errorf("DWARF register %d (%s): %w", number, unwindName(registers.Architecture, number), target.ErrUnavailable)
 	}
 	return registers.Values[number], nil
 }
 
 func recoverCFIFrame(ctx context.Context, metadata *CFIFrame, row unwindRow, registers AMD64UnwindRegisters, frame *UnwindFrame, budget *unwindBudget) (AMD64UnwindRegisters, bool, error) {
 	var next AMD64UnwindRegisters
-	returnRule := row.rules[16]
+	next.Architecture = registers.Architecture
+	abi := unwindABIFor(registers.Architecture)
+	returnRule := row.rules[uint64(abi.pc)]
 	complete := returnRule.kind == unwindUndefined && returnRule.explicit
 	if !row.cfa.defined {
 		if complete {
@@ -594,8 +642,11 @@ func recoverCFIFrame(ctx context.Context, metadata *CFIFrame, row unwindRow, reg
 	if err != nil {
 		return next, false, fmt.Errorf("CFA at %#x: %w", frame.LookupPC, err)
 	}
+	if abi.word == 4 && cfa > math.MaxUint32 {
+		return next, false, target.ErrOverflow
+	}
 	frame.CFA, frame.CFAKnown = target.Address(cfa), true
-	for number := uint64(0); number < 17; number++ {
+	for number := uint64(0); number < uint64(abi.count); number++ {
 		if err := budget.operation(ctx); err != nil {
 			return next, false, err
 		}
@@ -605,6 +656,9 @@ func recoverCFIFrame(ctx context.Context, metadata *CFIFrame, row unwindRow, reg
 			saved.Provenance = "cfi"
 		} else if rule.kind != unwindUndefined {
 			saved.Provenance = "abi:sysv-amd64"
+			if abi.word == 4 {
+				saved.Provenance = "abi:sysv-x86"
+			}
 		}
 		var value uint64
 		var available bool
@@ -622,7 +676,7 @@ func recoverCFIFrame(ctx context.Context, metadata *CFIFrame, row unwindRow, reg
 			value, err = unwindSignedAdd(cfa, rule.offset)
 			if err == nil && rule.kind == unwindOffset {
 				saved.Address, saved.AddressKnown = target.Address(value), true
-				value, err = budget.value(ctx, saved.Address, 8)
+				value, err = budget.value(ctx, saved.Address, abi.word)
 			} else if rule.kind == unwindValueOffset {
 				saved.Rule = "val_offset"
 			}
@@ -636,11 +690,14 @@ func recoverCFIFrame(ctx context.Context, metadata *CFIFrame, row unwindRow, reg
 			value, err = evaluateUnwindExpression(ctx, rule.expression, registers, &cfa, metadata, budget)
 			if err == nil && rule.kind == unwindExpression {
 				saved.Address, saved.AddressKnown = target.Address(value), true
-				value, err = budget.value(ctx, saved.Address, 8)
+				value, err = budget.value(ctx, saved.Address, abi.word)
 			} else if rule.kind == unwindValueExpression {
 				saved.Rule = "val_expression"
 			}
 			available = err == nil
+		}
+		if available && abi.word == 4 && value > math.MaxUint32 {
+			return next, false, target.ErrOverflow
 		}
 		saved.Value, saved.Available = value, available
 		frame.Saved = append(frame.Saved, saved)
@@ -654,8 +711,28 @@ func recoverCFIFrame(ctx context.Context, metadata *CFIFrame, row unwindRow, reg
 	if complete {
 		return next, true, nil
 	}
-	if next.Known&(1<<16) == 0 {
+	if next.Known&(1<<abi.pc) == 0 {
 		return next, false, fmt.Errorf("CFI return address is unavailable: %w", target.ErrUnavailable)
 	}
 	return next, false, nil
+}
+
+var x86UnwindNames = [...]string{"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "eip"}
+
+type unwindABI struct{ word, pc, count int }
+
+func unwindABIFor(arch target.Architecture) unwindABI {
+	if arch == target.X86 {
+		return unwindABI{4, 8, 9}
+	}
+	return unwindABI{8, 16, 17}
+}
+func unwindName(arch target.Architecture, n uint64) string {
+	if arch == target.X86 {
+		if n < 9 {
+			return x86UnwindNames[n]
+		}
+		return fmt.Sprintf("register%d", n)
+	}
+	return amd64UnwindNames[n]
 }

@@ -140,7 +140,7 @@ func formatHeapTcache(ctx context.Context, input heapGraphInput, observation hea
 		return "", err
 	}
 	fmt.Fprintf(&output, "%s\n", renderer.Text(display.StyleHeading, "[tcache]"))
-	fmt.Fprintf(&output, "tcache_perthread_struct=0x%016x encoding=%s (%d/%d confirmed bytes)\n", observation.address, input.layout.TcacheLink, len(observation.data), input.layout.Tcache.Size)
+	fmt.Fprintf(&output, "tcache_perthread_struct @ %s\n", renderer.Text(display.StyleCyan, fmt.Sprintf("0x%0*x", input.layout.Pointer*2, observation.address)))
 	var nodes, empty int
 	for _, bin := range observation.bins {
 		if err := contextReady(ctx); err != nil {
@@ -154,7 +154,7 @@ func formatHeapTcache(ctx context.Context, input heapGraphInput, observation hea
 		}
 		head := "<unconfirmed>"
 		if bin.headKnown {
-			head, _ = renderer.Address(target.AMD64, bin.head, display.AddressHeap)
+			head, _ = renderer.Address(target.Architecture(input.layout.Arch), bin.head, display.AddressHeap)
 		}
 		fmt.Fprintf(&output, "tcache[idx=%d", bin.index)
 		if bin.sizeMin != 0 {
@@ -171,27 +171,27 @@ func formatHeapTcache(ctx context.Context, input heapGraphInput, observation hea
 			}
 			fmt.Fprintf(&output, " %s.raw=%s", bin.counterName, value)
 		}
-		fmt.Fprintf(&output, " observed=%d complete=%t\n", len(bin.nodes), bin.complete)
+		fmt.Fprintf(&output, " count=%d\n", len(bin.nodes))
 		for _, node := range bin.nodes {
 			if err := contextReady(ctx); err != nil {
 				return "", err
 			}
 			nodes++
-			address, _ := renderer.Address(target.AMD64, node.address, display.AddressHeap)
+			address, _ := renderer.Address(target.Architecture(input.layout.Arch), node.address, display.AddressHeap)
 			fmt.Fprintf(&output, "  -> %s", address)
 			if node.chunkKnown {
-				chunk, _ := renderer.Address(target.AMD64, node.chunkAddress, display.AddressHeap)
+				chunk, _ := renderer.Address(target.Architecture(input.layout.Arch), node.chunkAddress, display.AddressHeap)
 				fmt.Fprintf(&output, " chunk=%s size=0x%x", chunk, node.chunkSize)
 			}
 			if node.linked {
-				next, _ := renderer.Address(target.AMD64, node.next, display.AddressHeap)
-				fmt.Fprintf(&output, " next.stored=0x%016x next=%s", node.stored, next)
+				next, _ := renderer.Address(target.Architecture(input.layout.Arch), node.next, display.AddressHeap)
+				fmt.Fprintf(&output, " next.stored=0x%0*x next=%s", input.layout.Pointer*2, node.stored, next)
 			} else {
 				fmt.Fprintf(&output, " <incomplete entry: %d confirmed bytes>", len(node.data))
 			}
 			if key, ok := input.layout.TcacheEntry.Fields["key"]; ok {
 				if value, confirmed := heapGraphField(node.data, key, 0); confirmed {
-					fmt.Fprintf(&output, " key.raw=0x%016x", value)
+					fmt.Fprintf(&output, " key.raw=0x%0*x", input.layout.Pointer*2, value)
 				}
 			}
 			output.WriteByte('\n')
@@ -203,6 +203,8 @@ func formatHeapTcache(ctx context.Context, input heapGraphInput, observation hea
 	if observation.err != nil {
 		fmt.Fprintf(&output, "<tcache root incomplete: %q>\n", observation.err.Error())
 	}
-	fmt.Fprintf(&output, "observed-tcache-entries=%d empty-lists=%d; counters are raw, not an allocation-state or ownership proof.\n", nodes, empty)
+	if nodes == 0 && empty == len(observation.bins) && observation.err == nil {
+		output.WriteString("  (empty)\n")
+	}
 	return output.String(), contextReady(ctx)
 }

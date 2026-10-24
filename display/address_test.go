@@ -52,10 +52,10 @@ func TestAddressUsesOnlyExplicitKind(t *testing.T) {
 				code string
 			}{
 				{display.AddressUnknown, ""},
-				{display.AddressCode, "31"},
+				{display.AddressCode, "35"},
 				{display.AddressData, "36"},
-				{display.AddressStack, "33"},
-				{display.AddressHeap, "35"},
+				{display.AddressStack, "36"},
+				{display.AddressHeap, "36"},
 			} {
 				want := text
 				if test.code != "" {

@@ -73,7 +73,11 @@ func elfCommandSymbolTable(file *elf.File, sectionIndex int) ([]elf.Symbol, erro
 	if section.Type != elf.SHT_SYMTAB && section.Type != elf.SHT_DYNSYM {
 		return nil, fmt.Errorf("section %q is not a symbol table: %w", section.Name, target.ErrInvalidArgument)
 	}
-	if section.Entsize != 24 || section.Size%24 != 0 || section.Size == 0 || int(section.Link) >= len(file.Sections) {
+	entrySize := uint64(24)
+	if file.Class == elf.ELFCLASS32 {
+		entrySize = 16
+	}
+	if section.Entsize != entrySize || section.Size%entrySize != 0 || section.Size == 0 || int(section.Link) >= len(file.Sections) {
 		return nil, fmt.Errorf("invalid symbol table %q: %w", section.Name, target.ErrInvalidArgument)
 	}
 	stringsSection := file.Sections[section.Link]
@@ -89,8 +93,8 @@ func elfCommandSymbolTable(file *elf.File, sectionIndex int) ([]elf.Symbol, erro
 		return nil, err
 	}
 	var result []elf.Symbol
-	for offset := 0; offset < len(data); offset += 24 {
-		entry := data[offset : offset+24]
+	for offset := 0; offset < len(data); offset += int(entrySize) {
+		entry := data[offset : offset+int(entrySize)]
 		nameOffset := binary.LittleEndian.Uint32(entry[:4])
 		if uint64(nameOffset) >= uint64(len(stringsData)) {
 			return nil, fmt.Errorf("symbol string offset %d: %w", nameOffset, target.ErrInvalidArgument)
@@ -98,6 +102,14 @@ func elfCommandSymbolTable(file *elf.File, sectionIndex int) ([]elf.Symbol, erro
 		nameEnd := bytes.IndexByte(stringsData[nameOffset:], 0)
 		if nameEnd < 0 {
 			return nil, fmt.Errorf("unterminated symbol name: %w", target.ErrInvalidArgument)
+		}
+		if file.Class == elf.ELFCLASS32 {
+			section := elf.SectionIndex(binary.LittleEndian.Uint16(entry[14:16]))
+			if section == elf.SHN_XINDEX {
+				return nil, target.ErrUnsupported
+			}
+			result = append(result, elf.Symbol{Name: string(stringsData[int(nameOffset) : int(nameOffset)+nameEnd]), Info: entry[12], Other: entry[13], Section: section, Value: uint64(binary.LittleEndian.Uint32(entry[4:8])), Size: uint64(binary.LittleEndian.Uint32(entry[8:12]))})
+			continue
 		}
 		section := elf.SectionIndex(binary.LittleEndian.Uint16(entry[6:8]))
 		if section == elf.SHN_XINDEX {
@@ -112,6 +124,10 @@ func elfCommandSymbolTable(file *elf.File, sectionIndex int) ([]elf.Symbol, erro
 }
 
 func elfCommandDynamic(file *elf.File) (elfDynamicFacts, error) {
+	word := 8
+	if file.Class == elf.ELFCLASS32 {
+		word = 4
+	}
 	facts := elfDynamicFacts{values: make(map[elf.DynTag][]uint64)}
 	for _, program := range file.Progs {
 		if program.Type != elf.PT_DYNAMIC {
@@ -121,7 +137,7 @@ func elfCommandDynamic(file *elf.File) (elfDynamicFacts, error) {
 			return elfDynamicFacts{}, fmt.Errorf("multiple PT_DYNAMIC headers: %w", target.ErrAmbiguous)
 		}
 		facts.present = true
-		if program.Filesz == 0 || program.Filesz%16 != 0 || program.Filesz > maxELFCommandMetadata {
+		if program.Filesz == 0 || program.Filesz%uint64(2*word) != 0 || program.Filesz > maxELFCommandMetadata {
 			return elfDynamicFacts{}, fmt.Errorf("invalid PT_DYNAMIC size: %w", target.ErrInvalidArgument)
 		}
 		data := make([]byte, int(program.Filesz))
@@ -129,9 +145,9 @@ func elfCommandDynamic(file *elf.File) (elfDynamicFacts, error) {
 			return elfDynamicFacts{}, err
 		}
 		terminated := false
-		for offset := 0; offset < len(data); offset += 16 {
-			tag := elf.DynTag(int64(binary.LittleEndian.Uint64(data[offset : offset+8])))
-			value := binary.LittleEndian.Uint64(data[offset+8 : offset+16])
+		for offset := 0; offset < len(data); offset += 2 * word {
+			tag := elf.DynTag(int64(inspectionWord(data[offset : offset+word])))
+			value := inspectionWord(data[offset+word : offset+2*word])
 			if tag == elf.DT_NULL {
 				terminated = true
 				break
@@ -160,7 +176,7 @@ func elfHasDynamicFlag(dynamic elfDynamicFacts, tag elf.DynTag, mask uint64) boo
 }
 
 func inspectELFSecurity(file *elf.File) (elfSecurityFacts, error) {
-	if err := validateAMD64ELF(file); err != nil {
+	if err := validateNativeELF(file); err != nil {
 		return elfSecurityFacts{}, err
 	}
 	dynamic, err := elfCommandDynamic(file)
@@ -237,7 +253,7 @@ func elfContainsLoadRange(file *elf.File, address, size uint64) bool {
 }
 
 func elfPointerRelocations(file *elf.File, bias uint64) ([]elfPointerRelocation, error) {
-	if err := validateAMD64ELF(file); err != nil {
+	if err := validateNativeELF(file); err != nil {
 		return nil, err
 	}
 	dynamic, err := elfCommandDynamic(file)
@@ -246,6 +262,10 @@ func elfPointerRelocations(file *elf.File, bias uint64) ([]elfPointerRelocation,
 	}
 	if err := validateELFDynamicRelocations(file, dynamic); err != nil {
 		return nil, err
+	}
+	word := 8
+	if file.Class == elf.ELFCLASS32 {
+		word = 4
 	}
 	var relocations []elfPointerRelocation
 	tables := make(map[uint32][]elf.Symbol)
@@ -258,6 +278,12 @@ func elfPointerRelocations(file *elf.File, bias uint64) ([]elfPointerRelocation,
 		if section.Type == elf.SHT_REL {
 			entrySize = 16
 		}
+		if file.Class == elf.ELFCLASS32 {
+			entrySize = 12
+			if section.Type == elf.SHT_REL {
+				entrySize = 8
+			}
+		}
 		if section.Entsize != entrySize || section.Size%entrySize != 0 || int(section.Link) >= len(file.Sections) {
 			return nil, fmt.Errorf("invalid relocation section %q: %w", section.Name, target.ErrInvalidArgument)
 		}
@@ -266,16 +292,21 @@ func elfPointerRelocations(file *elf.File, bias uint64) ([]elfPointerRelocation,
 			return nil, err
 		}
 		for offset := 0; offset < len(data); offset += int(entrySize) {
-			address := binary.LittleEndian.Uint64(data[offset : offset+8])
-			info := binary.LittleEndian.Uint64(data[offset+8 : offset+16])
+			address := inspectionWord(data[offset : offset+word])
+			info := inspectionWord(data[offset+word : offset+2*word])
 			kind, symbolIndex := elf.R_X86_64(uint32(info)), uint32(info>>32)
-			if kind != elf.R_X86_64_GLOB_DAT && kind != elf.R_X86_64_JMP_SLOT && kind != elf.R_X86_64_IRELATIVE {
+			indirect := elf.R_X86_64_IRELATIVE
+			if word == 4 {
+				kind, symbolIndex = elf.R_X86_64(info&255), uint32(info>>8)
+				indirect = elf.R_X86_64(elf.R_386_IRELATIVE)
+			}
+			if kind != elf.R_X86_64_GLOB_DAT && kind != elf.R_X86_64_JMP_SLOT && kind != indirect {
 				continue
 			}
-			if !elfContainsLoadRange(file, address, 8) {
+			if !elfContainsLoadRange(file, address, uint64(word)) {
 				return nil, fmt.Errorf("relocation slot %#x is outside PT_LOAD: %w", address, target.ErrInvalidArgument)
 			}
-			if address > math.MaxUint64-bias || 7 > math.MaxUint64-(address+bias) {
+			if address > math.MaxUint64-bias || uint64(word-1) > math.MaxUint64-(address+bias) {
 				return nil, target.ErrOverflow
 			}
 			if seen[address] {
@@ -338,6 +369,12 @@ func validateELFDynamicRelocations(file *elf.File, dynamic elfDynamicFacts) erro
 		}
 		if kind == elf.SHT_REL {
 			entrySize = 16
+		}
+		if file.Class == elf.ELFCLASS32 {
+			entrySize = 12
+			if kind == elf.SHT_REL {
+				entrySize = 8
+			}
 		}
 		if table.kind != elf.SHT_NULL && entries[0] != entrySize || sizes[0]%entrySize != 0 {
 			return fmt.Errorf("dynamic relocation entry size for %s: %w", table.address, target.ErrInvalidArgument)
@@ -518,23 +555,22 @@ func (c *Controller) showGOT(ctx context.Context, rawArgs string) error {
 				continue
 			}
 			view.module("got", module)
-			view.field("Load bias", fmt.Sprintf("%#x", module.LoadBias), metadataPlain)
 			view.note("Slot               Raw value          Relocation             Symbol / section", metadataPlain)
 			for _, relocation := range relocations {
 				if err := contextReady(ctx); err != nil {
 					return err
 				}
-				data := make([]byte, 8)
+				data := make([]byte, c.abi().word)
 				n, readErr := c.session.ReadSpaceMemory(snapshot.Memory, relocation.address, data)
 				data, readErr = inspectionConfirmedBytes(data, n, readErr)
 				if errors.Is(readErr, target.ErrStale) {
 					return readErr
 				}
 				var value uint64
-				if len(data) == 8 {
-					value = binary.LittleEndian.Uint64(data)
+				if len(data) == c.abi().word {
+					value = inspectionWord(data)
 				}
-				view.relocation(relocation, value, len(data) == 8, mappings)
+				view.relocation(relocation, value, len(data) == c.abi().word, mappings)
 				if readErr != nil {
 					readErrors = errors.Join(readErrors, fmt.Errorf("slot %#x: %w", relocation.address, readErr))
 				}
@@ -594,103 +630,4 @@ func elfStdioObject(module *mappedELF, name string) (target.Address, uint64, err
 		return 0, 0, target.ErrOverflow
 	}
 	return target.Address(symbol.Value + module.LoadBias), symbol.Size, nil
-}
-
-func (c *Controller) showStdio(ctx context.Context, rawArgs string) error {
-	if err := contextReady(ctx); err != nil {
-		return err
-	}
-	arguments, err := cli.ParseArgs(rawArgs)
-	if err != nil {
-		return err
-	}
-	selection := elfModuleSelection{All: true}
-	if len(arguments) != 0 {
-		if len(arguments) != 2 || arguments[0] != "--module" {
-			return fmt.Errorf("usage: stdio [--module EXACT]: %w", target.ErrInvalidArgument)
-		}
-		selection, _, err = parseELFModuleArguments(arguments, false)
-		if err != nil {
-			return err
-		}
-	}
-	snapshot, thread, err := c.stopped()
-	if err != nil {
-		return err
-	}
-	var output bytes.Buffer
-	view := *c
-	view.out = &output
-	var readErrors error
-	var symbolErrors error
-	var missing []string
-	err = c.withELFModules(ctx, snapshot, thread, selection, func(modules []*mappedELF) error {
-		type object struct {
-			name    string
-			module  *mappedELF
-			address target.Address
-			size    uint64
-		}
-		var objects []object
-		for _, name := range []string{"_IO_2_1_stdin_", "_IO_2_1_stdout_", "_IO_2_1_stderr_"} {
-			var matches []object
-			for _, module := range modules {
-				address, size, err := elfStdioObject(module, name)
-				if errors.Is(err, target.ErrNotFound) {
-					continue
-				}
-				if err != nil {
-					symbolErrors = errors.Join(symbolErrors, fmt.Errorf("module %q: %w", module.ID, err))
-					continue
-				}
-				matches = append(matches, object{name, module, address, size})
-			}
-			if len(matches) == 0 {
-				missing = append(missing, name)
-				continue
-			}
-			if len(matches) != 1 {
-				symbolErrors = errors.Join(symbolErrors, fmt.Errorf("stdio symbol %q occurs in %d mapped ELF images; use --module EXACT: %w", name, len(matches), target.ErrAmbiguous))
-				continue
-			}
-			objects = append(objects, matches[0])
-		}
-		for _, object := range objects {
-			if err := contextReady(ctx); err != nil {
-				return err
-			}
-			data := make([]byte, int(object.size))
-			n, readErr := c.session.ReadSpaceMemory(snapshot.Memory, object.address, data)
-			data, readErr = inspectionConfirmedBytes(data, n, readErr)
-			if errors.Is(readErr, target.ErrStale) {
-				return readErr
-			}
-			if err := view.writef("[stdio] %s module=%q %s=%q address=%#x declared-size=%d %s\nRaw object bytes; FILE member offsets are not inferred.\n", object.name, object.module.ID, mappedELFPathLabel(object.module), object.module.Path, object.address, object.size, mappedELFSourceDescription(object.module)); err != nil {
-				return err
-			}
-			if err := view.hexRows(object.address, data, 1); err != nil {
-				return err
-			}
-			if readErr != nil {
-				readErrors = errors.Join(readErrors, fmt.Errorf("stdio symbol %q: %w", object.name, readErr))
-			}
-		}
-		return nil
-	})
-	if !mappedELFResultUsable(err) {
-		return err
-	}
-	if err != nil || symbolErrors != nil {
-		if writeErr := c.writef("Stdio symbol scan incomplete; displayed definitions are not proven unique across all mapped images.\n"); writeErr != nil {
-			return errors.Join(writeErr, err, symbolErrors, readErrors)
-		}
-	}
-	for _, name := range missing {
-		missingErr := target.ErrNotFound
-		if err != nil || symbolErrors != nil {
-			missingErr = target.ErrUnavailable
-		}
-		readErrors = errors.Join(readErrors, fmt.Errorf("stdio symbol %q: %w", name, missingErr))
-	}
-	return c.publishELFResults(&output, err, errors.Join(readErrors, symbolErrors))
 }

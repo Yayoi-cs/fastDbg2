@@ -23,7 +23,7 @@ func TestAllocatorProfileMatchesReproducibleFixture(t *testing.T) {
 		t.Fatalf("generated profile fixture differs: %v", err)
 	}
 	profiles, err := knownAllocatorProfiles()
-	if err != nil || len(profiles) != 1 {
+	if err != nil || len(profiles) != 2 {
 		t.Fatalf("profiles=%v error=%v", profiles, err)
 	}
 	profile := profiles[0]

@@ -96,6 +96,15 @@ func readMappedSymbolFacts(ctx context.Context, module *mappedELF) moduleSymbolF
 }
 
 func (c *Controller) mappedSymbolFacts(ctx context.Context, snapshot target.Snapshot, thread target.ThreadInfo, selection elfModuleSelection) ([]moduleSymbolFacts, error) {
+	if remote, ok := c.session.(*qemuSession); ok {
+		if remote.image == nil {
+			return nil, target.ErrUnavailable
+		}
+		if err := remote.image.validate(); err != nil {
+			return nil, err
+		}
+		return []moduleSymbolFacts{remote.image.facts()}, nil
+	}
 	var facts []moduleSymbolFacts
 	err := c.withELFModules(ctx, snapshot, thread, selection, func(modules []*mappedELF) error {
 		for _, module := range modules {
@@ -186,8 +195,6 @@ func (c *Controller) renderSymbolFactsMapped(ctx context.Context, facts []module
 	filter = strings.ToLower(filter)
 	var failures []error
 	count := 0
-	hidden := 0
-	unavailable := 0
 	for _, module := range facts {
 		if err := contextReady(ctx); err != nil {
 			return errors.Join(append(failures, err)...)
@@ -203,26 +210,16 @@ func (c *Controller) renderSymbolFactsMapped(ctx context.Context, facts []module
 				}
 			}
 			if filter != "" && len(matching) == 0 {
-				hidden++
 				continue
 			}
 		}
 		view.output.Reset()
 		if module.header.present {
 			view.moduleHeader("", module.header)
-			if module.header.runtime {
-				view.note("Runtime dynamic symbols only; static symbols and debug metadata unavailable.", metadataUnknown)
-			}
 		} else {
-			view.field("Module", strconv.QuoteToGraphic(module.id), metadataPlain)
 			view.field("File", strconv.QuoteToGraphic(module.path), metadataPlain)
-			view.field("Source proof", strconv.QuoteToGraphic(module.proof), metadataPlain)
-			if module.metadata != "" {
-				view.field("Metadata", strconv.QuoteToGraphic(module.metadata), metadataPlain)
-			}
 		}
 		if module.err != nil {
-			unavailable++
 			failures = append(failures, fmt.Errorf("module %q: %w", module.id, module.err))
 			view.unavailable("Symbols", module.err)
 			if err := writef("%s", view.output.String()); err != nil {
@@ -243,13 +240,13 @@ func (c *Controller) renderSymbolFactsMapped(ctx context.Context, facts []module
 			symbol := module.symbols[index]
 			address := c.renderer.Text(display.StyleMuted, "<unavailable>")
 			if symbol.AddressKnown {
-				address = fmt.Sprintf("0x%016x", symbol.Address)
+				address = fmt.Sprintf("0x%0*x", c.abi().word*2, symbol.Address)
 				if symbol.Section != elf.SHN_ABS {
 					address = view.address(symbol.Address, mappings)
 				}
 			}
 			kind := c.renderer.Text(display.StyleHeading, display.Pad(symbol.Type.String(), 10))
-			name := c.renderer.Text(display.StyleSymbol, strconv.QuoteToGraphic(symbol.Name))
+			name := c.renderer.Text(display.StyleGreen, strconv.QuoteToGraphic(symbol.Name))
 			detail := fmt.Sprintf("version=%q value=%#x section=%s module=%q", symbol.Version, symbol.Value, symbolSectionText(symbol.Section), symbol.ModuleID)
 			if symbol.Section == elf.SHN_ABS {
 				detail += " (absolute scalar)"
@@ -264,10 +261,7 @@ func (c *Controller) renderSymbolFactsMapped(ctx context.Context, facts []module
 		return errors.Join(append(failures, err)...)
 	}
 	view.output.Reset()
-	view.note(fmt.Sprintf("%d symbol(s); names are literal ELF symbols, unavailable addresses are not inferred.", count), metadataUnknown)
-	if filter != "" {
-		view.note(fmt.Sprintf("Scope: %d module record(s); %d healthy no-match module(s) hidden; %d symbol table(s) unavailable.", len(facts), hidden, unavailable), metadataUnknown)
-	}
+	view.note(fmt.Sprintf("%d symbol(s)", count), metadataPlain)
 	if err := writef("%s", view.output.String()); err != nil {
 		return errors.Join(append(failures, err)...)
 	}
@@ -281,7 +275,14 @@ func symbolSectionText(section elf.SectionIndex) string {
 	return strconv.Itoa(int(section))
 }
 
-func telescopeArguments(rawArgs string) (string, int, int, error) {
+func telescopeArguments(rawArgs string, widths ...int) (string, int, int, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
+	if word != 4 && word != 8 {
+		return "", 0, 0, target.ErrInvalidArgument
+	}
 	args, err := cli.ParseArgs(rawArgs)
 	if err != nil {
 		return "", 0, 0, fmt.Errorf("telescope arguments: %w", errors.Join(target.ErrInvalidArgument, err))
@@ -303,8 +304,8 @@ func telescopeArguments(rawArgs string) (string, int, int, error) {
 	count := 128
 	if len(args) == 2 {
 		value, err := strconv.ParseUint(args[1], 0, 32)
-		if err != nil || value == 0 || value > maxMemoryBytes/8 {
-			return "", 0, 0, fmt.Errorf("telescope count must be between 1 and %d: %w", maxMemoryBytes/8, target.ErrInvalidArgument)
+		if err != nil || value == 0 || value > uint64(maxMemoryBytes/word) {
+			return "", 0, 0, fmt.Errorf("telescope count must be between 1 and %d: %w", maxMemoryBytes/word, target.ErrInvalidArgument)
 		}
 		count = int(value)
 	}
@@ -315,7 +316,7 @@ func (c *Controller) showTelescope(ctx context.Context, rawArgs string) error {
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	expression, count, depth, err := telescopeArguments(rawArgs)
+	expression, count, depth, err := telescopeArguments(rawArgs, c.abi().word)
 	if err != nil {
 		return err
 	}
@@ -327,7 +328,7 @@ func (c *Controller) showTelescope(ctx context.Context, rawArgs string) error {
 	if err != nil {
 		return err
 	}
-	if err := inspectionRange(address, count*8); err != nil {
+	if err := inspectionRange(address, count*c.abi().word); err != nil {
 		return err
 	}
 	walker, viewErr := c.newAddressView(ctx, snapshot, thread, registers)
@@ -335,6 +336,7 @@ func (c *Controller) showTelescope(ctx context.Context, rawArgs string) error {
 		return viewErr
 	}
 	if walker != nil {
+		walker.rowStyle = display.StyleBlue
 		body, readErr := walker.Rows(ctx, address, count, depth)
 		if addressWalkFatal(readErr) {
 			return errors.Join(viewErr, readErr)
@@ -350,7 +352,7 @@ func (c *Controller) showTelescope(ctx context.Context, rawArgs string) error {
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	data := make([]byte, count*8)
+	data := make([]byte, count*c.abi().word)
 	n, readErr := c.session.ReadSpaceMemory(snapshot.Memory, address, data)
 	data, readErr = inspectionConfirmedBytes(data, n, readErr)
 	if err := contextReady(ctx); err != nil {
@@ -360,18 +362,17 @@ func (c *Controller) showTelescope(ctx context.Context, rawArgs string) error {
 		return readErr
 	}
 	var output strings.Builder
-	output.WriteString("[telescope]\n")
-	for offset := 0; offset < len(data); offset += 8 {
-		row := data[offset:min(offset+8, len(data))]
-		addressText, err := c.renderer.Address(target.AMD64, address+target.Address(offset), display.AddressUnknown)
+	for offset := 0; offset < len(data); offset += c.abi().word {
+		row := data[offset:min(offset+c.abi().word, len(data))]
+		addressText, err := c.renderer.Address(c.abi().arch, address+target.Address(offset), display.AddressUnknown)
 		if err != nil {
 			return err
 		}
 		value := "<partial bytes: " + display.FormatBytes(row) + ">"
-		if len(row) == 8 {
-			value = fmt.Sprintf("0x%016x", inspectionWord(row))
+		if len(row) == c.abi().word {
+			value = fmt.Sprintf("0x%0*x", c.abi().word*2, inspectionWord(row))
 		}
-		fmt.Fprintf(&output, "%s:+0x%03x(+0x%02x)|%s\n", addressText, offset, offset/8, value)
+		fmt.Fprintf(&output, "%s:+0x%03x(+0x%02x)|%s\n", addressText, offset, offset/c.abi().word, value)
 	}
 	if err := c.displaySnapshotCurrent(ctx, snapshot, thread); err != nil {
 		return errors.Join(readErr, err)
@@ -416,7 +417,7 @@ func (c *Controller) showFSBase(ctx context.Context, rawArgs string) error {
 	if errors.Is(readErr, target.ErrStale) {
 		return readErr
 	}
-	if err := c.writef("[fs dump]\nfs_base = 0x%016x\n", base); err != nil {
+	if err := c.writef("fs_base = %s\n", c.renderer.Text(display.StyleCyan, fmt.Sprintf("0x%016x", base))); err != nil {
 		return err
 	}
 	if err := c.hexRows(target.Address(base), data, 8); err != nil {
@@ -583,7 +584,7 @@ func (c *Controller) showFunctionCode(ctx context.Context, token target.MemoryTo
 	if errors.Is(readErr, target.ErrStale) {
 		return readErr
 	}
-	instructions, decodeErr := inspect.Disassemble(target.AMD64, symbol.Address, data, maxFunctionInstructions)
+	instructions, decodeErr := inspect.Disassemble(c.abi().arch, symbol.Address, data, maxFunctionInstructions)
 	consumed := 0
 	for _, instruction := range instructions {
 		consumed += len(instruction.Bytes)
@@ -595,8 +596,8 @@ func (c *Controller) showFunctionCode(ctx context.Context, token target.MemoryTo
 	view.heading("disassembly")
 	view.field("Function", strconv.QuoteToGraphic(symbol.Name), metadataPlain)
 	view.field("Module", strconv.QuoteToGraphic(symbol.ModuleID), metadataPlain)
-	view.field("Address", fmt.Sprintf("0x%016x", symbol.Address), metadataPlain)
-	view.field("Extent", fmt.Sprintf("%d bytes (ELF STT_FUNC extent)", symbol.Size), metadataPlain)
+	view.field("Extent", fmt.Sprintf("%d bytes", symbol.Size), metadataPlain)
+	view.field("Address", fmt.Sprintf("0x%0*x", c.abi().word*2, symbol.Address), metadataPlain)
 	if err := c.writef("%s", view.output.String()); err != nil {
 		return err
 	}

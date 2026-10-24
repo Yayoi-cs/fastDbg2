@@ -14,8 +14,8 @@ import (
 
 	"fastdbg2/display"
 	"fastdbg2/inspect"
+	"fastdbg2/internal/cli"
 	"fastdbg2/native"
-	"fastdbg2/native/amd64"
 	"fastdbg2/target"
 )
 
@@ -36,6 +36,7 @@ type contextReader interface {
 }
 
 type contextOutput struct {
+	arch      target.Architecture
 	writef    func(string, ...any) error
 	renderer  display.Renderer
 	width     int
@@ -151,14 +152,17 @@ func (c *Controller) showContextWithPrefix(ctx context.Context, prefix string, e
 	return readErr
 }
 
-func registerArguments(rawArgs string) ([]string, error) {
+func registerArguments(rawArgs string, architectures ...target.Architecture) ([]string, error) {
 	arguments := strings.Fields(rawArgs)
 	if len(arguments) > 0 && (arguments[0] == "-s" || arguments[0] == "--simple") {
 		arguments = arguments[1:]
 	}
 	var names []string
 	seen := make(map[string]bool, len(arguments))
-	profile := amd64.Descriptor()
+	arch := target.AMD64
+	if len(architectures) > 0 {
+		arch = architectures[0]
+	}
 	for _, argument := range arguments {
 		name := strings.TrimPrefix(argument, "$")
 		if name == "" || strings.HasPrefix(name, "-") || strings.ContainsAny(name, "$'\"`\\") {
@@ -167,8 +171,8 @@ func registerArguments(rawArgs string) ([]string, error) {
 		if seen[name] {
 			return nil, fmt.Errorf("duplicate register name %q: %w", name, target.ErrInvalidArgument)
 		}
-		if _, ok := profile.Register(name); !ok {
-			return nil, fmt.Errorf("unknown AMD64 general register %q: %w", name, target.ErrNotFound)
+		if !nativeRegister(name, arch) {
+			return nil, fmt.Errorf("unknown general register %q: %w", name, target.ErrNotFound)
 		}
 		seen[name] = true
 		names = append(names, name)
@@ -211,7 +215,22 @@ func (c *Controller) showRegisters(ctx context.Context, arguments ...string) err
 	if len(arguments) == 1 {
 		rawArgs = arguments[0]
 	}
-	names, err := registerArguments(rawArgs)
+	names, err := registerArguments(rawArgs, c.abi().arch)
+	if _, ok := c.session.(*qemuSession); ok {
+		names, err = cli.ParseArgs(rawArgs)
+		if len(names) > 0 && (names[0] == "-s" || names[0] == "--simple") {
+			names = names[1:]
+		}
+		seen := make(map[string]bool)
+		for i, name := range names {
+			name = strings.TrimPrefix(name, "$")
+			names[i] = name
+			if name == "" || seen[name] {
+				err = target.ErrInvalidArgument
+			}
+			seen[name] = true
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -219,8 +238,8 @@ func (c *Controller) showRegisters(ctx context.Context, arguments ...string) err
 	if err != nil {
 		return err
 	}
-	if snapshot.Architecture != target.AMD64 {
-		return fmt.Errorf("register display requires amd64: %w", target.ErrUnsupported)
+	if snapshot.Architecture != target.AMD64 && snapshot.Architecture != target.X86 {
+		return fmt.Errorf("register display requires x86 or amd64: %w", target.ErrUnsupported)
 	}
 	if err := contextReady(ctx); err != nil {
 		return err
@@ -302,7 +321,7 @@ func (c *Controller) showMemory(ctx context.Context, rawArgs string) error {
 	if err := contextReady(ctx); err != nil {
 		return errors.Join(readErr, err)
 	}
-	view := contextOutput{writef: c.writef, renderer: c.renderer, width: display.OutputWidth(c.out)}
+	view := contextOutput{arch: c.abi().arch, writef: c.writef, renderer: c.renderer, width: display.OutputWidth(c.out)}
 	if err := view.heading("memory"); err != nil {
 		return errors.Join(readErr, err)
 	}
@@ -332,9 +351,10 @@ func (view contextOutput) renderContext(ctx context.Context, reader contextReade
 	if err := contextReady(ctx); err != nil {
 		return err
 	}
-	if snapshot.Architecture != target.AMD64 {
-		return fmt.Errorf("context display requires amd64: %w", target.ErrUnsupported)
+	if snapshot.Architecture != target.AMD64 && snapshot.Architecture != target.X86 {
+		return fmt.Errorf("context display requires x86 or amd64: %w", target.ErrUnsupported)
 	}
+	view.arch = snapshot.Architecture
 	view.ctx = ctx
 	if err := view.writef("Thread #%d (TID %d) %q — %s: %s\n", thread.Ref.ID, thread.TID, thread.Name, thread.State, thread.Stop.Reason); err != nil {
 		return err
@@ -389,7 +409,7 @@ func (view contextOutput) renderContext(ctx context.Context, reader contextReade
 	}
 	code := contextCode{err: registerErr}
 	if panes.code && !errors.Is(registerErr, target.ErrStale) {
-		code = readContextCode(reader, snapshot.Memory, thread.Token, registers, registerErr)
+		code = readContextCode(reader, snapshot.Memory, thread.Token, registers, registerErr, snapshot.Architecture)
 		readErrors = append(readErrors, code.err)
 	}
 	if err := contextReady(ctx); err != nil {
@@ -433,7 +453,7 @@ func (view contextOutput) stack(reader contextReader, memory target.MemoryToken,
 	if registerErr != nil {
 		return nil, view.unavailable(registerErr)
 	}
-	sp, err := contextRegisterValue(registers, "rsp")
+	sp, err := contextRegisterValue(registers, view.abi().sp)
 	if err != nil {
 		return err, view.unavailable(err)
 	}
@@ -445,7 +465,7 @@ func (view contextOutput) stack(reader contextReader, memory target.MemoryToken,
 		}
 		return err, view.writef("%s", rows)
 	}
-	data := make([]byte, contextReadSize(address, contextStackBytes))
+	data := make([]byte, contextReadSize(address, (contextStackBytes/8)*view.abi().word))
 	n, readErr := reader.ReadSpaceMemory(memory, address, data)
 	data, readErr = confirmedContextBytes(data, n, readErr)
 	if err := view.rawStackRows(registers, address, data); err != nil {
@@ -507,7 +527,7 @@ func (view contextOutput) registers(registers []target.Register, readErr error) 
 				text = fmt.Sprintf("0x%0*x", register.Bits/4, value)
 				if register.Name == "eflags" {
 					text += " " + view.flags(value)
-				} else if !view.simple && view.walker != nil && register.Bits == 64 && !uiSegment(register.Name) && register.Name != "orig_rax" {
+				} else if !view.simple && view.walker != nil && register.Bits == view.abi().bits && !uiSegment(register.Name) && register.Name != "orig_rax" && register.Name != "orig_eax" && register.Name != "cr0" && register.Name != "cr3" && register.Name != "cr4" && register.Name != "cr8" && register.Name != "efer" {
 					var chainErr error
 					text, chainErr = view.walker.Value(ctx, value, defaultAddressWalkDepth)
 					if uiDisplayFatal(chainErr) {
@@ -568,19 +588,23 @@ func contextRegisterValue(registers []target.Register, name string) (uint64, err
 	if found == nil {
 		return 0, fmt.Errorf("register %q: %w", name, target.ErrUnavailable)
 	}
-	if found.Bits != 64 {
+	if found.Bits != 64 && !(found.Bits == 32 && nativeRegister(name, target.X86)) {
 		return 0, fmt.Errorf("register %q is not 64-bit: %w", name, target.ErrUnavailable)
 	}
 	return contextScalar(*found)
 }
 
-func readContextCode(reader contextReader, memory target.MemoryToken, thread target.ThreadToken, registers []target.Register, registerErr error) contextCode {
+func readContextCode(reader contextReader, memory target.MemoryToken, thread target.ThreadToken, registers []target.Register, registerErr error, architectures ...target.Architecture) contextCode {
+	arch := target.AMD64
+	if len(architectures) > 0 {
+		arch = architectures[0]
+	}
 	location, err := reader.ReadCodeLocation(thread)
 	if err != nil {
 		return contextCode{err: err}
 	}
 	if registerErr == nil {
-		pc, err := contextRegisterValue(registers, "rip")
+		pc, err := contextRegisterValue(registers, abiFor(arch).pc)
 		if err == nil && target.Address(pc) != location.RawPC {
 			return contextCode{err: fmt.Errorf("code location disagrees with raw rip: %w", target.ErrStale)}
 		}
@@ -591,7 +615,7 @@ func readContextCode(reader contextReader, memory target.MemoryToken, thread tar
 	data := make([]byte, contextReadSize(location.InstructionPC, contextCodeBytes))
 	n, readErr := reader.ReadCodeMemory(memory, location.InstructionPC, data)
 	data, readErr = confirmedContextBytes(data, n, readErr)
-	instructions, decodeErr := inspect.Disassemble(target.AMD64, location.InstructionPC, data, contextInstructionCount)
+	instructions, decodeErr := inspect.Disassemble(arch, location.InstructionPC, data, contextInstructionCount)
 	return contextCode{location: &location, instructions: instructions, err: errors.Join(readErr, decodeErr)}
 }
 
@@ -604,10 +628,8 @@ func (view contextOutput) code(code contextCode) error {
 		byteWidth = max(byteWidth, 2*min(len(instruction.Bytes), 15))
 	}
 	for _, instruction := range code.instructions {
-		address, err := view.renderer.Address(target.AMD64, instruction.Address, display.AddressCode)
-		if view.walker != nil {
-			address, err = view.walker.Address(instruction.Address)
-		}
+		address, err := (display.Renderer{}).Address(view.abi().arch, instruction.Address, display.AddressUnknown)
+		address = view.renderer.Text(display.StyleBlue, address)
 		if err != nil {
 			return err
 		}
@@ -629,11 +651,6 @@ func (view contextOutput) code(code contextCode) error {
 			return err
 		}
 	}
-	if code.location != nil && code.location.Breakpoint != nil && code.location.RawPC != code.location.InstructionPC {
-		if err := view.writef("  %s\n", view.renderer.Text(display.StyleMuted, fmt.Sprintf("breakpoint instruction 0x%016x; raw $rip = 0x%016x", code.location.InstructionPC, code.location.RawPC))); err != nil {
-			return err
-		}
-	}
 	if code.err != nil {
 		return view.unavailable(code.err)
 	}
@@ -644,12 +661,12 @@ func (view contextOutput) rawMemory(start target.Address, data []byte, width int
 	for offset := 0; offset < len(data); offset += width {
 		end := min(offset+width, len(data))
 		row := data[offset:end]
-		address, err := view.renderer.Address(target.AMD64, start+target.Address(offset), kind)
+		address, err := view.renderer.Address(view.abi().arch, start+target.Address(offset), kind)
 		if err != nil {
 			return err
 		}
-		if words && len(row) == 8 {
-			if err := view.writef("%s  %-23s  0x%016x\n", address, display.FormatBytes(row), binary.LittleEndian.Uint64(row)); err != nil {
+		if words && len(row) == view.abi().word {
+			if err := view.writef("%s  %-*s  0x%0*x\n", address, view.abi().word*3-1, display.FormatBytes(row), view.abi().word*2, inspectionWord(row)); err != nil {
 				return err
 			}
 			continue

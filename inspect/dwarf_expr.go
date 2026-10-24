@@ -110,7 +110,11 @@ type unwindExpressionOp struct {
 	target int
 }
 
-func decodeUnwindExpression(ctx context.Context, data []byte) ([]unwindExpressionOp, error) {
+func decodeUnwindExpression(ctx context.Context, data []byte, widths ...int) ([]unwindExpressionOp, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
 	if len(data) == 0 || len(data) > 4096 {
 		return nil, fmt.Errorf("DWARF expression length %d: %w", len(data), target.ErrInvalidArgument)
 	}
@@ -125,7 +129,7 @@ func decodeUnwindExpression(ctx context.Context, data []byte) ([]unwindExpressio
 		instruction := unwindExpressionOp{start: start, opcode: reader.byte(), target: -1}
 		switch op := instruction.opcode; {
 		case op == 0x03:
-			instruction.value = reader.fixed(8)
+			instruction.value = reader.fixed(word)
 		case op >= 0x08 && op <= 0x0f:
 			size := 1 << ((op - 0x08) / 2)
 			instruction.value = reader.fixed(int(size))
@@ -182,7 +186,7 @@ func evaluateUnwindExpression(ctx context.Context, expression []byte, registers 
 	if err := budget.charge(ctx, len(expression)); err != nil {
 		return 0, err
 	}
-	program, err := decodeUnwindExpression(ctx, expression)
+	program, err := decodeUnwindExpression(ctx, expression, unwindABIFor(budget.arch).word)
 	if err != nil {
 		return 0, err
 	}
@@ -218,6 +222,9 @@ func evaluateUnwindExpression(ctx context.Context, expression []byte, registers 
 			if len(stack) == 64 {
 				return fmt.Errorf("DWARF expression stack depth: %w", target.ErrOverflow)
 			}
+			if unwindABIFor(budget.arch).word == 4 {
+				value = uint64(uint32(value))
+			}
 			stack = append(stack, value)
 			return nil
 		}
@@ -244,7 +251,7 @@ func evaluateUnwindExpression(ctx context.Context, expression []byte, registers 
 			}
 			err = push(value)
 		case op == 0x06 || op == 0x94:
-			size := 8
+			size := unwindABIFor(budget.arch).word
 			if op == 0x94 {
 				size = int(instruction.value)
 			}
@@ -270,6 +277,12 @@ func evaluateUnwindExpression(ctx context.Context, expression []byte, registers 
 			last := len(stack) - 1
 			switch op {
 			case 0x19:
+				if unwindABIFor(budget.arch).word == 4 {
+					if int32(stack[last]) == math.MinInt32 {
+						return 0, target.ErrOverflow
+					}
+					stack[last] = uint64(int64(int32(stack[last])))
+				}
 				if int64(stack[last]) == math.MinInt64 {
 					return 0, fmt.Errorf("undefined DWARF absolute value: %w", target.ErrOverflow)
 				}
@@ -287,6 +300,9 @@ func evaluateUnwindExpression(ctx context.Context, expression []byte, registers 
 			a, b := stack[len(stack)-2], stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 			value, e := unwindExpressionBinary(op, a, b)
+			if unwindABIFor(budget.arch).word == 4 {
+				value, e = unwindExpressionBinary32(op, a, b)
+			}
 			if e != nil {
 				return 0, e
 			}
@@ -300,6 +316,9 @@ func evaluateUnwindExpression(ctx context.Context, expression []byte, registers 
 		case op == 0x2f:
 			pc = instruction.target
 		case op == 0x96:
+		}
+		if unwindABIFor(budget.arch).word == 4 && len(stack) > 0 {
+			stack[len(stack)-1] = uint64(uint32(stack[len(stack)-1]))
 		}
 		if err != nil {
 			return 0, err
@@ -367,4 +386,21 @@ func unwindExpressionBinary(op byte, a, b uint64) (uint64, error) {
 	default:
 		return 0, target.ErrUnsupported
 	}
+}
+
+func unwindExpressionBinary32(op byte, a, b uint64) (uint64, error) {
+	a, b = uint64(uint32(a)), uint64(uint32(b))
+	if op >= 0x24 && op <= 0x26 && b >= 32 {
+		return 0, target.ErrInvalidArgument
+	}
+	if op == 0x1b && uint32(a) == 0x80000000 && uint32(b) == 0xffffffff {
+		return 0, target.ErrInvalidArgument
+	}
+	if op == 0x1b || op >= 0x2a && op <= 0x2d {
+		a, b = uint64(int64(int32(a))), uint64(int64(int32(b)))
+	} else if op == 0x26 {
+		a = uint64(int64(int32(a)))
+	}
+	value, err := unwindExpressionBinary(op, a, b)
+	return uint64(uint32(value)), err
 }

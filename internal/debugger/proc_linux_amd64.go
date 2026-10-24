@@ -103,6 +103,9 @@ func (c *Controller) verifyProcSnapshot(snapshot target.Snapshot, thread target.
 }
 
 func (c *Controller) withStoppedProc(ctx context.Context, snapshot target.Snapshot, thread target.ThreadInfo, read func(*stoppedProc) error) (err error) {
+	if _, ok := c.session.(*qemuSession); ok {
+		return fmt.Errorf("native process metadata is not guest kernel metadata: %w", target.ErrUnsupported)
+	}
 	if ctx == nil || read == nil {
 		return target.ErrInvalidArgument
 	}
@@ -296,6 +299,9 @@ func (p *stoppedProc) loadMaps() error {
 }
 
 func (c *Controller) readProcessMaps(ctx context.Context, snapshot target.Snapshot, thread target.ThreadInfo) ([]procMap, error) {
+	if remote, ok := c.session.(*qemuSession); ok {
+		return remote.addressWalkMaps(ctx, snapshot, thread)
+	}
 	var maps []procMap
 	err := c.withStoppedProc(ctx, snapshot, thread, func(p *stoppedProc) error {
 		var err error

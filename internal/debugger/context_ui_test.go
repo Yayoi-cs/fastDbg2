@@ -144,8 +144,8 @@ func TestUIDecorationsUseVerifiedPermissionsAndExactSymbols(t *testing.T) {
 	}
 	text := output.String()
 	for _, want := range []string{
-		"\x1b[36m0x0000000000500000\x1b[0m", "\x1b[34m0x0000000000600000\x1b[0m", "\x1b[31m0x0000000000401000\x1b[0m",
-		"$rsp>", "$rbp>", "|+0x0008|+001:", "<ui_probe>", "*->", "breakpoint instruction 0x0000000000401000; raw $rip = 0x0000000000401001",
+		"\x1b[36m0x0000000000500000\x1b[0m", "\x1b[34m0x0000000000600000\x1b[0m", "\x1b[35m0x0000000000401000\x1b[0m",
+		"$rsp>", "$rbp>", "|+0x0008|+001:", "<ui_probe>", "*->",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing permission/label/location %q: %q", want, text)
@@ -172,7 +172,7 @@ func TestUIChangedRegistersDoNotCrossThreadOrAddressSpace(t *testing.T) {
 		if err := c.showRegisters(context.Background(), "-s rax"); err != nil {
 			t.Fatal(err)
 		}
-		if got := strings.Contains(output.String(), "\x1b[1;31m$rax\x1b[0m"); got != want {
+		if got := strings.Contains(output.String(), "\x1b[31m$rax\x1b[0m"); got != want {
 			t.Fatalf("changed register marker=%t want %t: %q", got, want, output.String())
 		}
 	}
@@ -224,7 +224,7 @@ func TestUIOutputFailureDoesNotContinueReadingOrCommitHistory(t *testing.T) {
 	}
 }
 
-func TestUIExactSymbolAmbiguityIsNotGuessed(t *testing.T) {
+func TestUISymbolDisplayUsesOneLabel(t *testing.T) {
 	fixture, thread := newUIFixture()
 	fixture.symbols = append(fixture.symbols, inspect.Symbol{Name: "other_symbol", Address: 0x500000, AddressKnown: true, Size: 8})
 	var output bytes.Buffer
@@ -232,12 +232,12 @@ func TestUIExactSymbolAmbiguityIsNotGuessed(t *testing.T) {
 	if err := c.showRegisters(context.Background(), "rax"); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "<other_symbol | writable_value>") || !strings.Contains(output.String(), "0x0000000000500000") {
-		t.Fatalf("true symbol candidates were hidden or presented as unique: %s", output.String())
+	if !strings.Contains(output.String(), "<other_symbol>") || !strings.Contains(output.String(), "0x0000000000500000") {
+		t.Fatalf("single display label missing: %s", output.String())
 	}
 }
 
-func TestUIAddressSymbolCandidatesAreDeduplicatedOrderedAndBounded(t *testing.T) {
+func TestUIAddressSymbolDisplayPrefersExactThenShortestThenLexical(t *testing.T) {
 	fixture, thread := newUIFixture()
 	fixture.symbols = []inspect.Symbol{
 		{Name: "probe", Address: 0x401000, AddressKnown: true, Size: 32, Type: elf.STT_FUNC},
@@ -249,7 +249,7 @@ func TestUIAddressSymbolCandidatesAreDeduplicatedOrderedAndBounded(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := walker.symbol(0x401004); got != "probe_call | probe+0x4" {
+	if got := walker.symbol(0x401004); got != "probe_call" {
 		t.Fatalf("exact label/containing function candidates: %q", got)
 	}
 	for _, name := range []string{"c_label", "a_label", "b_label"} {
@@ -258,7 +258,7 @@ func TestUIAddressSymbolCandidatesAreDeduplicatedOrderedAndBounded(t *testing.T)
 	if err := c.addAddressSymbols(context.Background(), fixture.snapshot, thread, walker); err != nil {
 		t.Fatal(err)
 	}
-	if got := walker.symbol(0x401004); got != "a_label | b_label | c_label | +2 more" {
+	if got := walker.symbol(0x401004); got != "a_label" {
 		t.Fatalf("candidate order/dedup/bound: %q", got)
 	}
 }
@@ -352,6 +352,39 @@ func TestUIDirectBranchAnnotationUsesOnlyDecodedRelativeOperand(t *testing.T) {
 		got := view.instructionText(inspect.Instruction{Address: 0x401000, Bytes: test.bytes, Text: test.text})
 		if got != test.want {
 			t.Fatalf("branch %x: %q want %q", test.bytes, got, test.want)
+		}
+	}
+}
+
+func TestUISingleFreeSymbolAcrossViewsAndInputOrder(t *testing.T) {
+	names := []string{"__GI___libc_free", "cfree", "free", "__libc_free", "__GI_free"}
+	for rotation := range names {
+		fixture, thread := newUIFixture()
+		fixture.symbols = nil
+		for i := range names {
+			fixture.symbols = append(fixture.symbols, inspect.Symbol{Name: names[(i+rotation)%len(names)], Address: 0x401000, AddressKnown: true, Size: 32, Type: elf.STT_FUNC})
+		}
+		copy(fixture.code, []byte{0xf3, 0x0f, 0x1e, 0xfa})
+		var output bytes.Buffer
+		c := &Controller{session: fixture, selected: thread.Ref, out: &output}
+		for _, test := range []struct {
+			name, want string
+			run        func() error
+		}{
+			{"disassembly", "endbr64", func() error { return c.showDisassemble(context.Background(), "--count 1") }},
+			{"context", "<free> endbr64", func() error { return c.showContext(context.Background(), "code") }},
+			{"registers", "<free+0x1>", func() error { return c.showRegisters(context.Background(), "rip") }},
+			{"stack", "<free>", func() error { return c.showStack(context.Background(), "2") }},
+			{"telescope", "<free>", func() error { return c.showTelescope(context.Background(), "0x70000000 2") }},
+		} {
+			output.Reset()
+			if err := test.run(); err != nil {
+				t.Fatalf("%s: %v", test.name, err)
+			}
+			text := output.String()
+			if !strings.Contains(text, test.want) || strings.Contains(text, "cfree") || strings.Contains(text, "__libc_free") || strings.Contains(text, "more>") || strings.Contains(text, " | ") {
+				t.Fatalf("rotation %d %s: %s", rotation, test.name, text)
+			}
 		}
 	}
 }

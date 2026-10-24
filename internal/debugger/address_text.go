@@ -56,18 +56,18 @@ func (walker *addressWalker) rememberTextBytes(address target.Address, data []by
 }
 
 func (walker *addressWalker) textWord(address target.Address) (addressWalkWord, bool) {
-	if uint64(address) > math.MaxUint64-7 {
+	if uint64(address) > walker.abi().maximum-uint64(walker.abi().word-1) {
 		return addressWalkWord{}, false
 	}
-	word := addressWalkWord{n: 8}
-	for index := range word.data {
+	word := addressWalkWord{n: walker.abi().word}
+	for index := range word.data[:walker.abi().word] {
 		value, ok := walker.textBytes[address+target.Address(index)]
 		if !ok {
 			return addressWalkWord{}, false
 		}
 		word.data[index] = value
 	}
-	word.value = inspectionWord(word.data[:])
+	word.value = inspectionWord(word.data[:walker.abi().word])
 	return word, true
 }
 
@@ -191,7 +191,7 @@ func addressTextQuote(text string) string {
 }
 
 func (walker *addressWalker) leafText(ctx context.Context, address target.Address, source addressTextSource) (string, error) {
-	if available := walker.readableTextBytes(address, 8); available > 0 && available < 8 {
+	if available := walker.readableTextBytes(address, walker.abi().word); available > 0 && available < walker.abi().word {
 		source = addressTextSource{address: address, known: true}
 	}
 	if !source.known {
@@ -207,5 +207,10 @@ func (walker *addressWalker) leafText(ctx context.Context, address target.Addres
 	if text == "" {
 		return "", nil
 	}
-	return " " + walker.renderer.Text(display.StyleString, text), nil
+	index := walker.mapIndex(source.address)
+	if index >= 0 && walker.mapErr == nil {
+		mapping := walker.maps[index]
+		text = walker.renderer.PermissionText(text, mapping.Read, mapping.Write, mapping.Execute)
+	}
+	return " " + text, nil
 }

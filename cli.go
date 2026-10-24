@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -47,9 +48,15 @@ func runCLIInput(args []string, input io.Reader, output io.Writer) error {
 }
 
 type cliOptions struct {
-	file string
-	args []string
-	pid  int
+	qemu                  bool
+	qemuAddress, qemuHost string
+	qemuPort              int
+	vmlinux               string
+	kernelSlide           uint64
+	slideSet              bool
+	file                  string
+	args                  []string
+	pid                   int
 }
 
 func parseCLIOptions(args []string) (cliOptions, error) {
@@ -57,6 +64,47 @@ func parseCLIOptions(args []string) (cliOptions, error) {
 	var interactive, selected bool
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
+		case "-qemu", "--qemu":
+			if options.qemu {
+				return cliOptions{}, errors.New("QEMU mode specified twice")
+			}
+			options.qemu = true
+			if args[index] == "--qemu" {
+				index++
+				if index == len(args) {
+					return cliOptions{}, errors.New("--qemu requires HOST:PORT or unix:PATH")
+				}
+				options.qemuAddress = args[index]
+				if options.qemuAddress == "" {
+					return cliOptions{}, errors.New("empty QEMU address")
+				}
+			}
+		case "-qemu-host", "-qemu-port", "--vmlinux", "--kernel-slide":
+			flag := args[index]
+			index++
+			if index == len(args) {
+				return cliOptions{}, fmt.Errorf("%s requires a value", flag)
+			}
+			value := args[index]
+			switch flag {
+			case "-qemu-host":
+				options.qemuHost = value
+			case "-qemu-port":
+				port, err := strconv.Atoi(value)
+				if err != nil || port < 1 || port > 65535 {
+					return cliOptions{}, errors.New("invalid QEMU port")
+				}
+				options.qemuPort = port
+			case "--vmlinux":
+				options.vmlinux = value
+			case "--kernel-slide":
+				slide, err := strconv.ParseUint(value, 0, 64)
+				if err != nil || options.slideSet {
+					return cliOptions{}, errors.New("invalid or duplicate kernel slide")
+				}
+				options.kernelSlide = slide
+				options.slideSet = true
+			}
 		case "--interactive":
 			if interactive {
 				return cliOptions{}, errors.New("--interactive may only be specified once")
@@ -92,12 +140,46 @@ func parseCLIOptions(args []string) (cliOptions, error) {
 				return cliOptions{}, errors.New("-- ARGS requires -f FILE")
 			}
 			options.args = slices.Clone(args[index+1:])
-			return options, nil
+			index = len(args)
 		default:
 			return cliOptions{}, fmt.Errorf("unsupported option or argument: %q", args[index])
 		}
 	}
-	if !interactive && !selected {
+	if options.qemu {
+		if options.qemuAddress != "" && (options.qemuHost != "" || options.qemuPort != 0) {
+			return cliOptions{}, errors.New("use --qemu ADDRESS or -qemu-host/-qemu-port, not both")
+		}
+		if options.pid != 0 || len(options.args) != 0 {
+			return cliOptions{}, errors.New("QEMU mode cannot attach a host PID or pass process arguments")
+		}
+		if options.file != "" {
+			if options.vmlinux != "" {
+				return cliOptions{}, errors.New("specify -f or --vmlinux, not both")
+			}
+			options.vmlinux = options.file
+			options.file = ""
+		}
+		if options.qemuAddress == "" {
+			host := options.qemuHost
+			if host == "" {
+				host = "localhost"
+			}
+			port := options.qemuPort
+			if port == 0 {
+				port = 12345
+			}
+			options.qemuAddress = net.JoinHostPort(host, strconv.Itoa(port))
+		}
+		if options.vmlinux == "" && options.slideSet {
+			return cliOptions{}, errors.New("--kernel-slide requires --vmlinux")
+		}
+		if options.vmlinux != "" && !options.slideSet {
+			return cliOptions{}, errors.New("--vmlinux requires --kernel-slide (0 for nokaslr)")
+		}
+	} else if options.qemuAddress != "" || options.qemuHost != "" || options.qemuPort != 0 || options.vmlinux != "" || options.slideSet {
+		return cliOptions{}, errors.New("kernel options require -qemu or --qemu")
+	}
+	if !interactive && !selected && !options.qemu {
 		return cliOptions{}, errors.New("specify --interactive, -f FILE, or -p PID")
 	}
 	return options, nil
@@ -139,6 +221,11 @@ func runInteractiveOptions(options cliOptions, input io.Reader, output io.Writer
 		err = errors.Join(err, controller.Close(), reader.Close())
 		signals.Close()
 	}()
+	if options.qemu {
+		if err := controller.ConnectQEMU(signals.ctx, debugger.QEMUOptions{Address: options.qemuAddress, VMLinux: options.vmlinux, Slide: options.kernelSlide, SlideSet: options.slideSet}); err != nil {
+			return err
+		}
+	}
 	if options.file != "" {
 		if err := controller.Configure(options.file, options.args); err != nil {
 			return err

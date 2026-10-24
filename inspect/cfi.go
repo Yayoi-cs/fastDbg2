@@ -30,11 +30,12 @@ const (
 )
 
 type CFISection struct {
-	Kind     CFISectionKind
-	Address  target.Address
-	Data     []byte
-	LoadBias uint64
-	Source   string
+	AddressSize int
+	Kind        CFISectionKind
+	Address     target.Address
+	Data        []byte
+	LoadBias    uint64
+	Source      string
 }
 
 type CFIIndex struct {
@@ -74,6 +75,7 @@ type cfiProgram struct {
 }
 
 type cfiPointerBases struct {
+	word     int
 	text     *uint64
 	data     *uint64
 	function *uint64
@@ -89,6 +91,7 @@ type cfiRecord struct {
 }
 
 type cfiParser struct {
+	word       int
 	ctx        context.Context
 	kind       CFISectionKind
 	source     string
@@ -123,7 +126,7 @@ func (frame *CFIFrame) Entry() target.Address {
 }
 
 func ParseCFISection(ctx context.Context, section CFISection, read CFIReader) (index *CFIIndex, err error) {
-	if ctx == nil || (section.Kind != CFIEHFrame && section.Kind != CFIDebugFrame) {
+	if ctx == nil || (section.AddressSize != 0 && section.AddressSize != 4 && section.AddressSize != 8) || (section.Kind != CFIEHFrame && section.Kind != CFIDebugFrame) {
 		return nil, fmt.Errorf("CFI section: %w", target.ErrInvalidArgument)
 	}
 	defer func() {
@@ -147,7 +150,7 @@ func ParseCFISection(ctx context.Context, section CFISection, read CFIReader) (i
 		return nil, fmt.Errorf("runtime .eh_frame load bias: %w", target.ErrInvalidArgument)
 	}
 	parser := cfiParser{
-		ctx: ctx, kind: section.Kind, source: section.Source, loadBias: section.LoadBias,
+		word: cfiWord(section.AddressSize), ctx: ctx, kind: section.Kind, source: section.Source, loadBias: section.LoadBias,
 		read: read, records: make(map[uint64]cfiRecord), cies: make(map[uint64]cfiCIE),
 		frameBase: section.Address,
 	}
@@ -201,7 +204,14 @@ func ParseCFISection(ctx context.Context, section CFISection, read CFIReader) (i
 	return index, nil
 }
 
-func ReadCFIHeader(ctx context.Context, address target.Address, size uint64, source string, read CFIReader) (index *CFIIndex, err error) {
+func ReadCFIHeader(ctx context.Context, address target.Address, size uint64, source string, read CFIReader, widths ...int) (index *CFIIndex, err error) {
+	word := 8
+	if len(widths) > 0 {
+		word = widths[0]
+	}
+	if word != 4 && word != 8 {
+		return nil, target.ErrInvalidArgument
+	}
 	if ctx == nil || read == nil || size < 4 {
 		return nil, fmt.Errorf("CFI header: %w", target.ErrInvalidArgument)
 	}
@@ -237,7 +247,7 @@ func ReadCFIHeader(ctx context.Context, address target.Address, size uint64, sou
 	}
 	offset := 4
 	headerBase := uint64(address)
-	bases := cfiPointerBases{data: &headerBase}
+	bases := cfiPointerBases{word: word, data: &headerBase}
 	frameBase, err := cfiDecodePointer(ctx, data, &offset, address, data[1], bases, read)
 	if err != nil {
 		return nil, fmt.Errorf("CFI header frame pointer: %w", err)
@@ -245,7 +255,7 @@ func ReadCFIHeader(ctx context.Context, address target.Address, size uint64, sou
 	if frameBase == 0 {
 		return nil, fmt.Errorf("CFI header null frame pointer: %w", target.ErrInvalidArgument)
 	}
-	count, signed, err := cfiEncodedScalar(data, &offset, address, data[2])
+	count, signed, err := cfiEncodedScalar(data, &offset, address, data[2], word)
 	if err != nil {
 		return nil, fmt.Errorf("CFI header count: %w", err)
 	}
@@ -259,7 +269,7 @@ func ReadCFIHeader(ctx context.Context, address target.Address, size uint64, sou
 		return nil, fmt.Errorf("CFI header table encoding: %w", err)
 	}
 	parser := cfiParser{
-		ctx: ctx, kind: CFIEHFrame, source: source, read: read,
+		word: word, ctx: ctx, kind: CFIEHFrame, source: source, read: read,
 		records: make(map[uint64]cfiRecord), cies: make(map[uint64]cfiCIE),
 		frameBase: target.Address(frameBase), bytes: size, fromHeader: true,
 	}
@@ -481,7 +491,7 @@ func (parser *cfiParser) parseCIE(record cfiRecord) (cfiCIE, error) {
 	if err := cfiValidateAugmentation(augmentation); err != nil {
 		return cfiCIE{}, err
 	}
-	cie := cfiCIE{addressSize: 8, augmentation: augmentation, lsdaEncoding: 0xff}
+	cie := cfiCIE{addressSize: byte(cfiWord(parser.word)), augmentation: augmentation, lsdaEncoding: 0xff}
 	if version == 4 {
 		cie.addressSize, err = cfiByte(record.data, &offset)
 		if err != nil {
@@ -491,7 +501,7 @@ func (parser *cfiParser) parseCIE(record cfiRecord) (cfiCIE, error) {
 		if err != nil {
 			return cfiCIE{}, err
 		}
-		if cie.addressSize != 8 || segment != 0 {
+		if int(cie.addressSize) != cfiWord(parser.word) || segment != 0 {
 			return cfiCIE{}, fmt.Errorf("CIE address size %d segment size %d: %w", cie.addressSize, segment, target.ErrUnsupported)
 		}
 	}
@@ -536,7 +546,7 @@ func (parser *cfiParser) parseCIE(record cfiRecord) (cfiCIE, error) {
 					return cfiCIE{}, err
 				}
 				if encoding != 0xff {
-					if _, _, err := cfiEncodedScalar(data, &offset, record.address, encoding); err != nil {
+					if _, _, err := cfiEncodedScalar(data, &offset, record.address, encoding, parser.word); err != nil {
 						return cfiCIE{}, err
 					}
 				}
@@ -630,7 +640,7 @@ func (parser *cfiParser) parseFDE(record cfiRecord) (*CFIFrame, error) {
 		return nil, err
 	}
 	offset := record.body + record.idSize
-	start, err := cfiDecodePointer(parser.ctx, record.data, &offset, record.address, cie.pointerEncoding, cfiPointerBases{}, parser.read)
+	start, err := cfiDecodePointer(parser.ctx, record.data, &offset, record.address, cie.pointerEncoding, cfiPointerBases{word: parser.word}, parser.read)
 	if err != nil {
 		return nil, err
 	}
@@ -640,7 +650,7 @@ func (parser *cfiParser) parseFDE(record cfiRecord) (*CFIFrame, error) {
 			return nil, err
 		}
 	}
-	length, signed, err := cfiEncodedScalar(record.data, &offset, record.address, cie.pointerEncoding&0x0f)
+	length, signed, err := cfiEncodedScalar(record.data, &offset, record.address, cie.pointerEncoding&0x0f, parser.word)
 	if err != nil {
 		return nil, err
 	}
@@ -661,13 +671,16 @@ func (parser *cfiParser) parseFDE(record cfiRecord) (*CFIFrame, error) {
 		}
 		end := offset + int(length)
 		if length != 0 && cie.lsdaEncoding != 0xff {
-			if _, _, err := cfiEncodedScalar(record.data[:end], &offset, record.address, cie.lsdaEncoding); err != nil {
+			if _, _, err := cfiEncodedScalar(record.data[:end], &offset, record.address, cie.lsdaEncoding, parser.word); err != nil {
 				return nil, err
 			}
 		}
 		if offset != end {
 			return nil, fmt.Errorf("FDE augmentation excess data: %w", target.ErrInvalidArgument)
 		}
+	}
+	if cfiWord(parser.word) == 4 && (start > math.MaxUint32 || end > uint64(math.MaxUint32)+1) {
+		return nil, target.ErrOverflow
 	}
 	return &CFIFrame{
 		start: target.Address(start), end: target.Address(end), source: parser.source, entry: record.address,
@@ -766,7 +779,7 @@ func cfiDecodePointer(ctx context.Context, data []byte, offset *int, address tar
 	if err != nil {
 		return 0, err
 	}
-	value, signed, err := cfiEncodedScalar(data, offset, address, encoding)
+	value, signed, err := cfiEncodedScalar(data, offset, address, encoding, bases.word)
 	if err != nil {
 		return 0, err
 	}
@@ -807,12 +820,19 @@ func cfiDecodePointer(ctx context.Context, data []byte, offset *int, address tar
 			}
 		}
 	}
+	if cfiWord(bases.word) == 4 && value > math.MaxUint32 {
+		if signed && encoding&0x70 == 0 {
+			value = uint64(uint32(value))
+		} else {
+			return 0, target.ErrOverflow
+		}
+	}
 	if encoding&0x80 != 0 {
 		if read == nil {
 			return 0, fmt.Errorf("CFI indirect pointer: %w", target.ErrUnavailable)
 		}
 		var pointer [8]byte
-		if err := cfiRead(ctx, read, target.Address(value), pointer[:]); err != nil {
+		if err := cfiRead(ctx, read, target.Address(value), pointer[:cfiWord(bases.word)]); err != nil {
 			return 0, err
 		}
 		value = binary.LittleEndian.Uint64(pointer[:])
@@ -841,7 +861,11 @@ func cfiValidateEncoding(encoding byte, omit bool) error {
 	return nil
 }
 
-func cfiEncodedScalar(data []byte, offset *int, address target.Address, encoding byte) (uint64, bool, error) {
+func cfiEncodedScalar(data []byte, offset *int, address target.Address, encoding byte, widths ...int) (uint64, bool, error) {
+	word := 8
+	if len(widths) > 0 {
+		word = cfiWord(widths[0])
+	}
 	if offset == nil || *offset < 0 || *offset > len(data) {
 		return 0, false, fmt.Errorf("CFI encoded scalar bounds: %w", target.ErrInvalidArgument)
 	}
@@ -853,7 +877,7 @@ func cfiEncodedScalar(data []byte, offset *int, address target.Address, encoding
 		if err != nil {
 			return 0, false, err
 		}
-		padding := (8 - field%8) % 8
+		padding := (uint64(word) - field%uint64(word)) % uint64(word)
 		if padding > uint64(len(data)-*offset) {
 			return 0, false, fmt.Errorf("CFI aligned pointer bounds: %w", target.ErrInvalidArgument)
 		}
@@ -869,6 +893,9 @@ func cfiEncodedScalar(data []byte, offset *int, address target.Address, encoding
 		return uint64(value), true, err
 	}
 	size := 8
+	if format == 0 || format == 8 {
+		size = word
+	}
 	switch format {
 	case 2, 10:
 		size = 2
@@ -887,7 +914,7 @@ func cfiEncodedScalar(data []byte, offset *int, address target.Address, encoding
 		}
 	case 4:
 		value = uint64(binary.LittleEndian.Uint32(data[*offset:]))
-		if format == 11 {
+		if format == 11 || format == 8 {
 			value = uint64(int64(int32(value)))
 		}
 	case 8:
@@ -982,4 +1009,11 @@ func cfiZero(data []byte) bool {
 		}
 	}
 	return true
+}
+
+func cfiWord(word int) int {
+	if word == 4 {
+		return 4
+	}
+	return 8
 }

@@ -81,7 +81,7 @@ func TestSIMDUIRegisterStylesDoNotAlterPlainPayloads(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if vmmapTestSGR.ReplaceAllString(colored.String(), "") != plain.String() || !strings.Contains(colored.String(), "\x1b[1;34mXMM0  : \x1b[0m") || !strings.Contains(colored.String(), "\x1b[1;34mYMM0  : \x1b[0m") {
+	if vmmapTestSGR.ReplaceAllString(colored.String(), "") != plain.String() || !strings.Contains(colored.String(), "XMM0  : ") || !strings.Contains(colored.String(), "YMM0  : ") || strings.Contains(colored.String(), "\x1b[") {
 		t.Fatalf("styles changed values or omitted register identity: %q", colored.String())
 	}
 	if strings.Count(plain.String(), "\n") != 3 || !strings.Contains(plain.String(), "\n        f64-le:[") {

@@ -324,7 +324,7 @@ func (c *Controller) heapGraphHeading(ctx context.Context, name string, input he
 	if err := (contextOutput{writef: c.writef, renderer: c.renderer}).heading(name); err != nil {
 		return err
 	}
-	return c.heapGraphWritef(ctx, "%s\nschema=1 root-kind=malloc_state layout=glibc amd64 little-endian fast-link=%s; observed raw fields and links only. Allocation state and thread ownership are not inferred.\n", input.proof, input.layout.FastLink)
+	return nil
 }
 
 func (c *Controller) heapGraphWritef(ctx context.Context, format string, args ...any) error {
@@ -371,7 +371,7 @@ func (c *Controller) showArenas(ctx context.Context, rawArgs string) error {
 		return strings.Compare(a, b)
 	})
 	for index, arena := range arenas {
-		if outputErr := c.heapGraphWritef(ctx, "arena[%d] 0x%016x (%d/%d confirmed bytes)\n", index, arena.address, len(arena.data), input.layout.Arena.Size); outputErr != nil {
+		if outputErr := c.heapGraphWritef(ctx, "arena[%d] 0x%0*x (%d/%d confirmed bytes)\n", index, c.abi().word*2, arena.address, len(arena.data), input.layout.Arena.Size); outputErr != nil {
 			return errors.Join(err, outputErr)
 		}
 		for _, name := range names {

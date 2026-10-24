@@ -25,7 +25,7 @@ func TestRunCLIHelp(t *testing.T) {
 			if err := runCLI(args, &output); err != nil {
 				t.Fatal(err)
 			}
-			for _, want := range []string{"fastDbg2", "Usage:", "--interactive", "-f FILE", "-p PID", "Linux/amd64 native debugger"} {
+			for _, want := range []string{"fastDbg2", "Usage:", "--interactive", "-f FILE", "-p PID", "Linux/amd64 host", "native x86 (32-bit) and amd64 targets"} {
 				if !strings.Contains(output.String(), want) {
 					t.Fatalf("help does not contain %q: %q", want, output.String())
 				}
